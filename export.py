@@ -80,6 +80,12 @@ def parse_args():
                    default="matmul",
                    choices=["einsum", "matmul"],
                    help="Outer product pattern for Phase 5 (einsum or matmul-based)")
+    p.add_argument("--phase6a", action="store_true",
+                   help="Enable Phase 6a: tanh + softplus gating only")
+    p.add_argument("--phase6b", action="store_true",
+                   help="Enable Phase 6b: + cos/sin accumulation (implies 6a)")
+    p.add_argument("--phase6c", action="store_true",
+                   help="Enable Phase 6c: + full pairwise rotation (implies 6a, 6b)")
     p.add_argument("--out-dir", default="./exported_model")
     p.add_argument("--no-verify", action="store_true",
                    help="Skip la vérification numérique")
@@ -98,7 +104,16 @@ def export(args):
     phase4_cfg = config.get("phase4", {})
     
     # Apply config values (but CLI args take precedence)
-    if args.phase5:
+    if args.phase6a or args.phase6b or args.phase6c:
+        # When any phase6 is passed via CLI, enable it (auto-enables all previous: 2, 3, 4, 5)
+        args.phase2 = True
+        args.phase3 = True
+        args.phase4 = True
+        args.phase5 = True
+        args.num_states = 3
+        args.phase4_pattern = "mul"  # Phase 6 uses optimal Phase 4 pattern
+        args.phase5_pattern = "matmul"  # Phase 6 uses optimal Phase 5 pattern
+    elif args.phase5:
         # When phase5 is passed via CLI, enable it (auto-enables 2, 3, 4)
         args.phase2 = True
         args.phase3 = True
@@ -139,7 +154,15 @@ def export(args):
     phase_suffix = ""
     phase4_suffix = ""
     phase5_suffix = ""
-    if args.phase5:
+    phase6_suffix = ""
+    if args.phase6a or args.phase6b or args.phase6c:
+        if args.phase6c:
+            phase6_suffix = " + Phase 6c (RoPE rotation)"
+        elif args.phase6b:
+            phase6_suffix = " + Phase 6b (cos/sin)"
+        else:
+            phase6_suffix = " + Phase 6a (tanh/softplus)"
+    elif args.phase5:
         phase5_suffix = f" + Phase 5 ({args.phase5_pattern})"
     elif args.phase4:
         phase4_suffix = f" + Phase 4 ({args.phase4_pattern})"
@@ -149,7 +172,7 @@ def export(args):
         phase_suffix = " + Phase 2"
     
     if args.backbone == "mlp":
-        phase_label = f"Phase 1{phase_suffix}{phase4_suffix}{phase5_suffix}"
+        phase_label = f"Phase 1{phase_suffix}{phase4_suffix}{phase5_suffix}{phase6_suffix}"
         print(f"\n[1/5] Build StatefulMobileNet {phase_label} (MLP, input_dim={args.input_dim}, classes={args.classes})")
         model = StatefulMobileNet(
             num_classes=args.classes,
@@ -163,9 +186,12 @@ def export(args):
             phase4_pattern=args.phase4_pattern,
             phase5=args.phase5,
             phase5_pattern=args.phase5_pattern,
+            phase6a=args.phase6a,
+            phase6b=args.phase6b,
+            phase6c=args.phase6c,
         )
     elif args.backbone == "hybrid":
-        phase_label = f"Phase 1.5{phase_suffix}{phase4_suffix}{phase5_suffix}"
+        phase_label = f"Phase 1.5{phase_suffix}{phase4_suffix}{phase5_suffix}{phase6_suffix}"
         print(f"\n[1/5] Build StatefulMobileNet {phase_label} (Hybrid CNN+MLP, classes={args.classes})")
         model = StatefulMobileNet(
             num_classes=args.classes,
@@ -178,9 +204,12 @@ def export(args):
             phase4_pattern=args.phase4_pattern,
             phase5=args.phase5,
             phase5_pattern=args.phase5_pattern,
+            phase6a=args.phase6a,
+            phase6b=args.phase6b,
+            phase6c=args.phase6c,
         )
     else:
-        phase_label = f"Phase 0{phase_suffix}{phase4_suffix}{phase5_suffix}"
+        phase_label = f"Phase 0{phase_suffix}{phase4_suffix}{phase5_suffix}{phase6_suffix}"
         print(f"\n[1/5] Build StatefulMobileNet {phase_label} (CNN, width={args.width}, classes={args.classes})")
         model = StatefulMobileNet(
             num_classes=args.classes,
@@ -194,6 +223,9 @@ def export(args):
             phase4_pattern=args.phase4_pattern,
             phase5=args.phase5,
             phase5_pattern=args.phase5_pattern,
+            phase6a=args.phase6a,
+            phase6b=args.phase6b,
+            phase6c=args.phase6c,
         )
     model.eval()
 
@@ -206,9 +238,10 @@ def export(args):
         if args.num_states >= 4:
             print(f", dv_state {model.dv_state.shape}", end="")
         if args.phase5:
-            print(f", ssm_state {model.ssm_state.shape}")
-        else:
-            print()
+            print(f", ssm_state {model.ssm_state.shape}", end="")
+        if args.phase6b:
+            print(f", theta_state {model.theta_state.shape}", end="")
+        print()
     else:
         print(f"      State shape: {model.feature_state.shape}")
 
@@ -220,6 +253,10 @@ def export(args):
         required_buffers = ["angle_state", "k_state", "v_state"]
         if args.num_states >= 4:
             required_buffers.append("dv_state")
+        if args.phase5:
+            required_buffers.extend(["a_coeff", "b_coeff", "g_coeff", "ssm_state"])
+        if args.phase6b:
+            required_buffers.append("theta_state")
         for buf in required_buffers:
             assert buf in buffers, f"ERROR: '{buf}' absent de named_buffers() !"
     else:
@@ -279,11 +316,21 @@ def export(args):
                     name="ssm_state",
                 )
             )
+        # Phase 6: Add theta_state (if phase6b enabled)
+        if args.phase6b:
+            states_list.append(
+                ct.StateType(
+                    wrapped_type=ct.TensorType(shape=model.theta_state.shape),
+                    name="theta_state",
+                )
+            )
         print(f"      → states=[ct.StateType('angle_state'), ct.StateType('k_state'), ct.StateType('v_state')", end="")
         if args.num_states >= 4:
             print(", ct.StateType('dv_state')", end="")
         if args.phase5:
-            print(", ct.StateType('ssm_state')]")
+            print(", ct.StateType('ssm_state')", end="")
+        if args.phase6b:
+            print(", ct.StateType('theta_state')]")
         else:
             print("]")
     else:

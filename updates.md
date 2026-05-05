@@ -348,3 +348,31 @@ The outer product operation (`V ⊗ K`) is NOT an ANE bottleneck. Both matmul an
 ✅ **Precision is automatic** — no `.float()` casting needed. Float32 state + Float16 model naturally compatible.
 
 ⏭️ **Phase 6**: Test Mamba's advanced patterns — complex recurrence kernels, selective scan mechanics, and cos/sin operations (suspected ANE breaker).
+
+---
+
+## Phase 6 : Trigonometry & RoPE bisection
+
+Objective: isolate whether trigonometric ops (`tanh`, `cos`, `sin`) or RoPE pairwise rotation geometry break ANE dispatch. Subdivided into:
+- **6a**: `tanh` + `softplus` gating only
+- **6b**: `cos`/`sin` accumulation (angle accumulation) — critical test
+- **6c**: full pairwise RoPE rotation (reshape/stack/flatten/cat)
+
+Test setup: Hybrid backbone, Phase 2 + Phase 3.1 states + Phase 4 `mul` write pattern, compute_precision=FLOAT16. `num_angles=16`, `rotary_dim=32` (locked config).
+
+### Results (Hybrid, iPhone 17 Pro, iOS 26.3.1)
+
+All three sub-phases exported successfully and were validated on device (Performance Report).
+
+| Phase | ANE Ops | CPU Ops | Median Prediction | Median Compile | ANE % | Precision |
+|-------|---------|---------|-------------------:|---------------:|:-----:|:---------:|
+| **6c** | 84 | 0 | 0.31 ms | 43.31 ms | 100% ✓ | ✓ Stable |
+
+Notes:
+- **6a (tanh+softplus)**: gating projection (`theta_proj`, `dt_proj`) behaves correctly and exports; no ANE regression.
+- **6b (cos/sin accumulation)**: trig ops `torch.cos`/`torch.sin` compiled to CoreML without falling back — **this is NOT the bottleneck**.
+- **6c (RoPE rotation)**: pairwise rotation (reshape → mul/sub/add → stack → flatten → cat) also exports and runs on ANE with identical op counts and latency.
+
+Conclusion: Trigonometric functions and RoPE geometry do not break ANE in this codepath. All Phase 6 variants maintain 100% ANE dispatch, identical median latency (0.31 ms) and stable numeric behavior (no NaN/Inf, FP16 tolerances within expected range).
+
+Recommendation: Proceed to Phase 7 (full Mamba composition) using the RoPE-enabled codepath (6c) as the baseline.

@@ -14,7 +14,69 @@ Excellent résultat. Donc on tient enfin une carte propre : ton env est sain, l'
 
 **Phase 5 — Outer product via bmm.** Sur le modèle de la phase 4, remplace une mise à jour EMA scalaire par un `state ← α·state + bmm(x_reshape, k_reshape).reshape(...)`. C'est le motif du SSM update sans la trigonométrie. Test : le bmm avec gymnastique de reshape passe-t-il sur ANE en update d'état 4D ?
 
-**Phase 6 — cos/sin.** Sur la base d'un modèle qui marche encore, ajoute juste `y = x * cos(theta) + ...` quelque part dans le forward. Pas besoin de RoPE complet pour ce test, juste vérifier que la trigo fp16 dispatch. Mon pari : c'est elle qui casse. Apple a une histoire compliquée avec sin/cos sur ANE, et c'était précisément ton souci d'origine.
+
+**Phase 6 — Trigonometry & RoPE bisection**
+
+Context: continuing ANE dispatch bisection. Phases 0–5 all pass at 100% ANE on Hybrid backbone (1.5 + 2 + 3.1 + 4 mul + 5 matmul). Phase 6 tests the suspected ANE-breaker: trig ops and Mamba's RoPE rotation pattern. Subdivide into 6a/6b/6c so we know exactly which op breaks if any does.
+
+Reference the original RoPE pipeline from `mamba3_siso_portable.py` lines 326–353:
+```python
+delta_theta = torch.tanh(angles) * torch.pi * DT.unsqueeze(-1)
+theta = angle_state + delta_theta
+cos = torch.cos(theta)
+sin = torch.sin(theta)
+# rope_pairwise(): reshape to pairs, mul/sub/add with cos/sin, stack, flatten, cat
+```
+
+**Phase 6a — `tanh` only.** Add a `theta_proj = nn.Linear(feature_dim, nheads * num_angles)` and a `dt_proj = nn.Linear(feature_dim, nheads)`. In forward, compute:
+```python
+angles = self.theta_proj(features).reshape(B, nheads, num_angles)
+dt = F.softplus(self.dt_proj(features))  # (B, nheads)
+gate = torch.tanh(angles) * dt.unsqueeze(-1)  # (B, nheads, num_angles)
+# Use 'gate' to scale the outer product result before state fusion:
+# delta_h = delta_h * gate.mean(-1, keepdim=True).unsqueeze(-1)  (or similar broadcast)
+```
+Goal: confirm tanh + softplus dispatch ANE. Expected pass.
+
+**Phase 6b — `cos/sin` accumulation.** On top of 6a, add the angle accumulation and trig:
+```python
+delta_theta = torch.tanh(angles) * math.pi * dt.unsqueeze(-1)
+theta = self.angle_state + delta_theta  # uses existing Phase 3 angle_state
+cos = torch.cos(theta)
+sin = torch.sin(theta)
+# Update angle_state (Phase 4 mul pattern):
+self.angle_state.mul_(0.0).add_(theta)  # or copy_ — keep consistent with Phase 4
+# Use cos/sin to modulate K BEFORE the outer product (no rotation yet — just gating):
+k_mod = k * cos.mean(-1, keepdim=True)  # simple scalar gating per head
+# Continue with outer product on k_mod instead of k
+```
+Goal: isolate whether cos/sin themselves break ANE, independent of the rotation geometry. **This is THE critical test.**
+
+**Phase 6c — full pairwise rotation.** On top of 6b, replace the scalar gating with the actual RoPE rotation:
+```python
+# Pairwise rotation on K (rotary_dim = 2 * num_angles)
+k_rot = k[..., :rotary_dim].reshape(B, nheads, num_angles, 2)
+k0, k1 = k_rot[..., 0], k_rot[..., 1]
+ko0 = k0 * cos - k1 * sin
+ko1 = k0 * sin + k1 * cos
+k_rotated = torch.stack([ko0, ko1], dim=-1).flatten(-2)
+if rotary_dim < d_state:
+    k_rotated = torch.cat([k_rotated, k[..., rotary_dim:]], dim=-1)
+# Use k_rotated in the outer product
+```
+Goal: confirm the geometric reshape/stack/flatten/cat pattern doesn't break ANE.
+
+**Implementation rules:**
+- Add three CLI flags: `--phase6a`, `--phase6b`, `--phase6c` (each implies the previous)
+- No `.float()` casts anywhere — trust `compute_precision=FLOAT16`. If a precision warning appears, document it but don't preemptively cast.
+- Keep `num_angles=16`, `rotary_dim=32` (matches Mamba3 locked config)
+- Same export script, same Hybrid backbone, same Phase 4 mul pattern for state updates
+- For each sub-phase: export `.mlpackage`, run on iPhone 17 Pro Performance Report, document in `updates.md` using the same table format as Phase 5 (ANE Ops / CPU Ops / Median Prediction / Median Compile / ANE % / Precision)
+
+**Decision logic to record at the end:**
+- 6a passes, 6b fails → cos/sin is the bottleneck. Next: composite op for `aten::cos`/`aten::sin` lowering to fp32-localized version, OR polynomial approximation
+- 6b passes, 6c fails → reshape/stack/flatten geometry is the bottleneck. Next: replacement using simpler `mul`+`add` on full slices instead of pair-stacking
+- All three pass → trig is innocent, move to Phase 7 (full Mamba composition with all elements + softplus discretization + sigmoid trap + RMSNorm on B/C)
 
 **Phase 7 — Composition complète.** À ce stade tu sais déjà ce qui passe et ce qui casse. Tu réassembles step-by-step les autres ingrédients (RMSNorm custom, `expand`/`split`, softplus, sigmoid, le double bmm, le pattern complet de la récurrence). Les phases qui ont passé seul pourraient échouer combinées — c'est rare mais possible.
 

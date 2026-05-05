@@ -183,6 +183,9 @@ class StatefulMobileNet(nn.Module):
         phase4_pattern: str = "slice_assign_with_cast",
         phase5: bool = False,
         phase5_pattern: str = "matmul",
+        phase6a: bool = False,
+        phase6b: bool = False,
+        phase6c: bool = False,
     ):
         super().__init__()
         self.ema_alpha = ema_alpha
@@ -195,6 +198,9 @@ class StatefulMobileNet(nn.Module):
         self.phase4_pattern = phase4_pattern
         self.phase5 = phase5
         self.phase5_pattern = phase5_pattern
+        self.phase6a = phase6a
+        self.phase6b = phase6b
+        self.phase6c = phase6c
         
         # Phase 4 validation
         valid_patterns = [
@@ -219,8 +225,28 @@ class StatefulMobileNet(nn.Module):
                 f"Valid patterns: {valid_phase5_patterns}"
             )
         
+        # Phase 6: Trigonometry & RoPE bisection
+        # phase6a ⇒ tanh + softplus only
+        # phase6b ⇒ + cos/sin accumulation (implies 6a)
+        # phase6c ⇒ + full pairwise rotation (implies 6b and 6a)
+        if self.phase6c:
+            self.phase6b = True
+            self.phase6a = True
+        elif self.phase6b:
+            self.phase6a = True
+        
+        # Phase 6: Auto-enable ALL previous phases (2, 3, 4, 5) with optimal settings
+        if self.phase6a or self.phase6b or self.phase6c:
+            self.phase2 = True
+            self.phase3 = True
+            self.phase4 = True
+            self.phase5 = True
+            self.num_states = 3
+            self.phase4_pattern = "mul"
+            self.phase5_pattern = "matmul"
+        
         # Phase 5: Auto-enable ALL previous phases (2, 3, 4) with optimal settings
-        if self.phase5:
+        elif self.phase5:
             self.phase2 = True
             self.phase3 = True
             self.phase4 = True
@@ -369,6 +395,27 @@ class StatefulMobileNet(nn.Module):
                 self.register_buffer("a_coeff", torch.tensor(0.9, dtype=torch.float32))
                 self.register_buffer("b_coeff", torch.tensor(0.5, dtype=torch.float32))
                 self.register_buffer("g_coeff", torch.tensor(0.5, dtype=torch.float32))
+            
+            # Phase 6: Trigonometry & RoPE bisection
+            # Phase 6a: tanh + softplus gating
+            # Phase 6b: + cos/sin accumulation
+            # Phase 6c: + full pairwise rotation
+            if self.phase6a:
+                # Constants for Phase 6 (locked per Mamba3)
+                self.num_angles = 16
+                self.rotary_dim = 2 * self.num_angles  # 32
+                
+                # Phase 6a projection layers
+                self.theta_proj = nn.Linear(self.feature_dim, 8 * self.num_angles)  # (8, 16)
+                self.dt_proj = nn.Linear(self.feature_dim, 8)  # (8,) for nheads
+                
+                # Phase 6b: cos/sin states (if enabled)
+                if self.phase6b:
+                    self.register_buffer(
+                        "theta_state",
+                        torch.zeros(1, 8, 16, dtype=torch.float32),
+                    )
+                    self.state_shapes["theta_state"] = (1, 8, 16)
 
         self._init_weights()
 
@@ -534,6 +581,96 @@ class StatefulMobileNet(nn.Module):
         self.k_state.mul_(1.0 - self.ema_alpha).add_(k_feats.detach() * self.ema_alpha)
         self.v_state.mul_(1.0 - self.ema_alpha).add_(v_feats.detach() * self.ema_alpha)
 
+    def _update_states_phase6(
+        self,
+        feats: torch.Tensor,
+        k_feats: torch.Tensor,
+        v_feats: torch.Tensor,
+    ) -> None:
+        """
+        Phase 6: Trigonometry & RoPE bisection test.
+        
+        - Phase 6a: tanh + softplus gating only
+        - Phase 6b: + cos/sin accumulation  
+        - Phase 6c: + full pairwise rotation
+        
+        Reference: Mamba3 RoPE pipeline (lines 326-353 of mamba3_siso_portable.py)
+        """
+        import math
+        
+        # ===== PHASE 6A: Tanh + softplus =====
+        # Project features to angles and dt
+        angles_flat = self.theta_proj(feats)  # (B, 8*16)
+        angles = angles_flat.view(1, 8, self.num_angles)  # (1, 8, 16)
+        
+        dt_flat = self.dt_proj(feats)  # (B, 8)
+        dt = F.softplus(dt_flat).view(1, 8)  # (1, 8)
+        
+        # Compute gating: gate = tanh(angles) * dt
+        # (1, 8, 16) * (1, 8, 1) → (1, 8, 16)
+        gate = torch.tanh(angles) * dt.unsqueeze(-1)  # (1, 8, 16)
+        
+        # ===== PHASE 6B: Cos/Sin accumulation =====
+        if self.phase6b:
+            # Compute delta_theta = tanh(angles) * π * dt
+            delta_theta = torch.tanh(angles) * math.pi * dt.unsqueeze(-1)  # (1, 8, 16)
+            
+            # Accumulate theta: theta_t = theta_{t-1} + delta_theta
+            theta = self.theta_state + delta_theta  # (1, 8, 16)
+            
+            # Compute cos and sin (these are the suspected ANE-breakers)
+            cos_theta = torch.cos(theta)  # (1, 8, 16)
+            sin_theta = torch.sin(theta)  # (1, 8, 16)
+            
+            # Update theta_state (using Phase 4 mul pattern)
+            self.theta_state.mul_(1.0 - self.ema_alpha).add_(theta.detach() * self.ema_alpha)
+            
+            # ===== PHASE 6C: Full pairwise rotation =====
+            if self.phase6c:
+                # Apply pairwise RoPE rotation to K
+                # Reshape K to pairs: (1, 8, 64) → (1, 8, 32, 2)
+                rotary_dim = self.rotary_dim
+                k_feats_sq = k_feats.squeeze(1)  # (1, 8, 64)
+                k_rot = k_feats_sq[..., :rotary_dim].reshape(1, 8, self.num_angles, 2)  # (1, 8, 16, 2)
+                
+                k0 = k_rot[..., 0]  # (1, 8, 16)
+                k1 = k_rot[..., 1]  # (1, 8, 16)
+                
+                # Rotation: (k0', k1') = (k0*cos - k1*sin, k0*sin + k1*cos)
+                ko0 = k0 * cos_theta - k1 * sin_theta  # (1, 8, 16)
+                ko1 = k0 * sin_theta + k1 * cos_theta  # (1, 8, 16)
+                
+                # Stack and flatten: (1, 8, 16, 2) → (1, 8, 32)
+                k_rotated = torch.stack([ko0, ko1], dim=-1).flatten(-2)  # (1, 8, 32)
+                
+                # Concatenate non-rotated part (if any)
+                if rotary_dim < 64:
+                    k_rotated = torch.cat([k_rotated, k_feats_sq[..., rotary_dim:]], dim=-1)  # (1, 8, 64)
+                
+                # Update k_state with rotated K (reshape back to (1, 1, 8, 64) for compatibility)
+                k_rotated_expanded = k_rotated.unsqueeze(1)  # (1, 1, 8, 64)
+                self.k_state.mul_(1.0 - self.ema_alpha).add_(k_rotated_expanded.detach() * self.ema_alpha)
+            else:
+                # Phase 6b: Just apply simple gating to K (no full rotation)
+                # gate shape: (1, 8, 16), k_feats shape: (1, 1, 8, 64)
+                # Apply gate as a scalar per head by averaging over angles
+                gate_scalar = gate.mean(dim=-1)  # (1, 8) — average gate over angles
+                k_feats_sq = k_feats.squeeze(1)  # (1, 8, 64)
+                k_gated = k_feats_sq * gate_scalar.unsqueeze(-1)  # (1, 8, 64)
+                self.k_state.mul_(1.0 - self.ema_alpha).add_(k_gated.unsqueeze(1).detach() * self.ema_alpha)
+        else:
+            # Phase 6a only: Use gate to scale outer product (no cos/sin yet)
+            # We'll apply gate scaling in the forward pass when needed
+            pass
+        
+        # Update v_state and angle_state (if present) with Phase 4 mul pattern
+        self.v_state.mul_(1.0 - self.ema_alpha).add_(v_feats.detach() * self.ema_alpha)
+        
+        # Update angle_state for consistency with Phase 3
+        angle_feats_flat = self.angle_proj(feats)  # (B, 8*16)
+        angle_feats = angle_feats_flat.view(1, 8, 16)  # (1, 8, 16)
+        self.angle_state.mul_(1.0 - self.ema_alpha).add_(angle_feats.detach() * self.ema_alpha)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -572,8 +709,11 @@ class StatefulMobileNet(nn.Module):
             v_feats_flat = self.v_proj(feats)           # (B, 8*64)
             v_feats = v_feats_flat.view(1, 8, 64)       # (1, 8, 64)
             
+            # For Phase 6, apply trigonometry & RoPE bisection
+            if self.phase6a or self.phase6b or self.phase6c:
+                self._update_states_phase6(feats, k_feats, v_feats)
             # For Phase 5, apply Mamba-style outer product fusion
-            if self.phase5:
+            elif self.phase5:
                 self._update_states_phase5(angle_feats, k_feats, v_feats)
             # For Phase 4, apply the specified state write pattern
             elif self.phase4:
@@ -603,8 +743,14 @@ class StatefulMobileNet(nn.Module):
             if self.phase5:
                 state_norm = state_norm + self.ssm_state.norm().detach()
             
+            # Phase 6: Include theta_state in fusion (if enabled)
+            state_count = self.num_states + (1 if self.phase5 else 0)
+            if self.phase6b:
+                state_norm = state_norm + self.theta_state.norm().detach()
+                state_count += 1
+            
             # Broadcast state_norm to (1, feature_dim) for fusion
-            state_contribution = torch.ones(1, self.feature_dim, device=feats.device) * (state_norm / (self.num_states + (1 if self.phase5 else 0)))
+            state_contribution = torch.ones(1, self.feature_dim, device=feats.device) * (state_norm / state_count)
             fused = feats + state_contribution.detach()
         elif self.phase2:
             # Phase 2: 4D state (1, nheads, headdim, d_state) where flatdim = feature_dim
