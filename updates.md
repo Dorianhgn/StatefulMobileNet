@@ -253,3 +253,98 @@ Test which state buffer **update patterns** remain ANE-compatible. This isolates
 ✅ **Recommendation**: Continue using `mul_.add_()` pattern (Phase 0-3 baseline) for optimal performance. Alternative: `slice_assign_no_cast` if slice-based API is required (+3% compile cost).
 
 ⏭️ **Phase 5+ not needed for state patterns**. All patterns compatible with ANE. Next investigation: complex recurrence kernels (bmm, outer products), trigonometry (cos/sin), and full Mamba composition.
+
+---
+
+## Phase 5 : Mamba-Style Outer Product State Fusion
+
+Test whether Mamba's outer product mixing (V ⊗ K) breaks ANE dispatch. This is a key Mamba operation for state fusion.
+
+### Architecture
+
+**SSM State Fusion** (trapezoid rule):
+```
+Outer products: (B, H, P) × (B, H, S) → (B, H, P, S)
+  outer_prev = V_prev ⊗ K_prev
+  outer_curr = V_curr ⊗ K_curr
+
+Trapezoid mixing:
+  delta_h = b·outer_prev + g·outer_curr
+  new_h = a·ssm_state + delta_h
+  
+State update (in-place mul_.add_() from Phase 4):
+  ssm_state ← (1-α)·ssm_state + α·new_h
+```
+
+### Two Patterns Tested
+
+**Pattern 1: Matmul-based** (vectorized unsqueeze + matmul)
+```python
+outer = torch.matmul(
+    v.unsqueeze(-1),  # (1, 8, 64, 1)
+    k.unsqueeze(-2),  # (1, 8, 1, 64)
+)  # → (1, 8, 64, 64)
+```
+
+**Pattern 2: Einsum-based** (direct tensor product notation)
+```python
+outer = torch.einsum("bhp,bhs->bhps", v, k)  # (1, 8, 64, 64)
+```
+
+### State Buffers (Phase 5 Hybrid)
+
+| Buffer | Shape | Size | Role |
+|--------|-------|------|------|
+| `ssm_state` | (1, 8, 64, 64) | 32KB | Main fusion state (NEW!) |
+| `k_state` | (1, 1, 8, 64) | 2KB | K from previous step |
+| `v_state` | (1, 8, 64) | 2KB | V from previous step |
+| `angle_state` | (1, 8, 16) | 0.5KB | Auxiliary state (Phase 3) |
+| Coefficients | scalars | 12B | a, b, g mixing weights |
+
+### Device Results - Hybrid (1.5 + Phase 2 + Phase 3.1 + Phase 4 mul + Phase 5 outer product)
+
+**iPhone 17 Pro, iOS 26.3.1**
+
+| Pattern | ANE Ops | CPU Ops | Median Prediction | Median Compile | ANE % | Precision |
+|---------|---------|---------|-------------------|-----------------|-------|-----------|
+| **matmul** | 64 | 0 | **0.31 ms** | 23.47 ms | 100% ✓ | ✓ Clean |
+| **einsum** | 66 | 0 | **0.31 ms** | 23.95 ms | 100% ✓ | ✓ Clean |
+
+### Performance Analysis
+
+✅ **Both outer product patterns maintain 100% ANE dispatch!**
+
+✅ **Prediction latency: Identical 0.31 ms** — both patterns equally fast, matching Phase 3.1 hybrid baseline.
+
+✅ **Op count**: 
+- Matmul: 64 ops (slightly more efficient)
+- Einsum: 66 ops (2 more ops, negligible)
+
+⚠️ **Precision Check**:
+- ✅ **No numerical errors detected** during export or device testing
+- ✅ Both patterns export cleanly with no precision warnings
+- ✅ CoreML model sizes identical (2.8 MB for Hybrid)
+- ✅ No `.float()` conversions needed in practice
+- → Float32 state buffers + Float16 CoreML weights **automatically compatible with ANE**
+
+### Critical Finding
+
+**Mamba-style outer product fusion is ANE-friendly!** ✅
+
+The outer product operation (`V ⊗ K`) is NOT an ANE bottleneck. Both matmul and einsum variants:
+- Dispatch at 100% ANE
+- Execute in parallel with state updates
+- Require no manual precision casting
+- Maintain performance baseline
+
+### Conclusions Phase 5
+
+✅ **Outer products pass ANE dispatch test**. No performance regression vs Phase 3.1 (still 0.31 ms).
+
+✅ **Trapezoid mixing rule is ANE-compatible**. All blending coefficients efficiently incorporated.
+
+✅ **Recommendation**: Use **matmul pattern** (64 ops vs 66) for slight efficiency gain. Einsum equally viable if clearer code preferred.
+
+✅ **Precision is automatic** — no `.float()` casting needed. Float32 state + Float16 model naturally compatible.
+
+⏭️ **Phase 6**: Test Mamba's advanced patterns — complex recurrence kernels, selective scan mechanics, and cos/sin operations (suspected ANE breaker).
