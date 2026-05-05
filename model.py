@@ -177,12 +177,41 @@ class StatefulMobileNet(nn.Module):
         backbone_type: str = "cnn",
         input_dim: int = 256,
         phase2: bool = False,
+        phase3: bool = False,
+        num_states: int = 1,
+        phase4: bool = False,
+        phase4_pattern: str = "slice_assign_with_cast",
     ):
         super().__init__()
         self.ema_alpha = ema_alpha
         self.backbone_type = backbone_type
         self.input_dim = input_dim
         self.phase2 = phase2
+        self.phase3 = phase3
+        self.num_states = num_states
+        self.phase4 = phase4
+        self.phase4_pattern = phase4_pattern
+        
+        # Phase 4 validation
+        valid_patterns = [
+            "addition",
+            "mul",
+            "copy",
+            "clone",
+            "slice_assign_with_cast",
+            "slice_assign_no_cast",
+        ]
+        if self.phase4 and self.phase4_pattern not in valid_patterns:
+            raise ValueError(
+                f"Invalid phase4_pattern '{self.phase4_pattern}'. "
+                f"Valid patterns: {valid_patterns}"
+            )
+        
+        # Phase 4: Auto-enable Phase 2 and Phase 3 with 3 states
+        if self.phase4:
+            self.phase2 = True
+            self.phase3 = True
+            self.num_states = 3  # Phase 4 uses 3 states: angle, k, v
 
         # Backbone
         if backbone_type == "cnn":
@@ -249,18 +278,64 @@ class StatefulMobileNet(nn.Module):
         # ── STATE ──────────────────────────────────────────────────────────
         # register_buffer → persistant dans le modèle, traceable par TorchScript
         # Nom "feature_state" = celui qu'on passera à ct.StateType(name=...)
-        # Phase 2: shape 4D (1, 8, 64, 64) ; Phase 1/0: shape 2D (1, feature_dim)
-        if self.phase2:
+        # Phase 3: Multiple state buffers REPLACE feature_state
+        # Phase 2: 4D feature_state
+        # Phase 0/1: 2D feature_state
+        
+        if not self.phase3:
+            # Only register feature_state if NOT Phase 3
+            if self.phase2:
+                self.register_buffer(
+                    "feature_state",
+                    torch.zeros(*self.state_shape, dtype=torch.float32),
+                )
+            else:
+                self.register_buffer(
+                    "feature_state",
+                    torch.zeros(1, self.feature_dim, dtype=torch.float32),
+                )
+        
+        # Phase 3: Multiple state buffers
+        # Shapes per plan.md: angle_state (1, 8, 16), k_state (1, 1, 8, 64), v_state (1, 8, 64)
+        if self.phase3:
+            self.state_shapes = {}
+            
+            # State 1: angle_state (1, 8, 16) = 128 elements
             self.register_buffer(
-                "feature_state",
-                torch.zeros(*self.state_shape, dtype=torch.float32),
+                "angle_state",
+                torch.zeros(1, 8, 16, dtype=torch.float32),
             )
-        else:
+            self.state_shapes["angle_state"] = (1, 8, 16)
+            # Projection layer for angle_state
+            self.angle_proj = nn.Linear(self.feature_dim, 8 * 16)
+            
+            # State 2: k_state (1, 1, 8, 64) = 512 elements
             self.register_buffer(
-                "feature_state",
-                torch.zeros(1, self.feature_dim, dtype=torch.float32),
+                "k_state",
+                torch.zeros(1, 1, 8, 64, dtype=torch.float32),
             )
-        # ──────────────────────────────────────────────────────────────────
+            self.state_shapes["k_state"] = (1, 1, 8, 64)
+            # Projection layer for k_state
+            self.k_proj = nn.Linear(self.feature_dim, 1 * 8 * 64)
+            
+            # State 3: v_state (1, 8, 64) = 512 elements
+            self.register_buffer(
+                "v_state",
+                torch.zeros(1, 8, 64, dtype=torch.float32),
+            )
+            self.state_shapes["v_state"] = (1, 8, 64)
+            # Projection layer for v_state
+            self.v_proj = nn.Linear(self.feature_dim, 8 * 64)
+            
+            # State 4 (optional): dv_state (1, 8, 64) = 512 elements (for phase 3.2)
+            if self.num_states >= 4:
+                self.register_buffer(
+                    "dv_state",
+                    torch.zeros(1, 8, 64, dtype=torch.float32),
+                )
+                self.state_shapes["dv_state"] = (1, 8, 64)
+                # Projection layer for dv_state
+                self.dv_proj = nn.Linear(self.feature_dim, 8 * 64)        # ──────────────────────────────────────────────────────────────────
 
         self._init_weights()
 
@@ -276,6 +351,80 @@ class StatefulMobileNet(nn.Module):
             elif isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, 0, 0.01)
                 nn.init.zeros_(m.bias)
+
+    def _update_states_phase4(
+        self,
+        angle_feats: torch.Tensor,
+        k_feats: torch.Tensor,
+        v_feats: torch.Tensor,
+    ) -> None:
+        """
+        Phase 4: Apply different state write patterns to test which breaks ANE.
+        
+        Patterns:
+        - "addition": new allocation
+        - "mul": in-place mul_.add_()
+        - "copy": in-place copy_()
+        - "clone": detach + clone
+        - "slice_assign_with_cast": explicit to(float16)
+        - "slice_assign_no_cast": implicit dtype preservation
+        """
+        alpha = self.ema_alpha
+        feats_detached_angle = angle_feats.detach()
+        feats_detached_k = k_feats.detach()
+        feats_detached_v = v_feats.detach()
+        
+        if self.phase4_pattern == "addition":
+            # New allocation: state = state + (1 - α) * features
+            self.angle_state = self.angle_state + (1.0 - alpha) * feats_detached_angle
+            self.k_state = self.k_state + (1.0 - alpha) * feats_detached_k
+            self.v_state = self.v_state + (1.0 - alpha) * feats_detached_v
+        
+        elif self.phase4_pattern == "mul":
+            # In-place mul_.add_() (baseline method)
+            self.angle_state.mul_(1.0 - alpha).add_(feats_detached_angle * alpha)
+            self.k_state.mul_(1.0 - alpha).add_(feats_detached_k * alpha)
+            self.v_state.mul_(1.0 - alpha).add_(feats_detached_v * alpha)
+        
+        elif self.phase4_pattern == "copy":
+            # In-place copy_()
+            new_angle = feats_detached_angle * alpha + self.angle_state * (1.0 - alpha)
+            new_k = feats_detached_k * alpha + self.k_state * (1.0 - alpha)
+            new_v = feats_detached_v * alpha + self.v_state * (1.0 - alpha)
+            
+            self.angle_state.copy_(new_angle)
+            self.k_state.copy_(new_k)
+            self.v_state.copy_(new_v)
+        
+        elif self.phase4_pattern == "clone":
+            # Detach + clone
+            new_angle = self.angle_state.detach().clone() + feats_detached_angle
+            new_k = self.k_state.detach().clone() + feats_detached_k
+            new_v = self.v_state.detach().clone() + feats_detached_v
+            
+            self.angle_state = new_angle
+            self.k_state = new_k
+            self.v_state = new_v
+        
+        elif self.phase4_pattern == "slice_assign_with_cast":
+            # Explicit cast to float16 via slice assignment
+            new_angle = feats_detached_angle * alpha + self.angle_state * (1.0 - alpha)
+            new_k = feats_detached_k * alpha + self.k_state * (1.0 - alpha)
+            new_v = feats_detached_v * alpha + self.v_state * (1.0 - alpha)
+            
+            self.angle_state[:] = new_angle.to(torch.float16)
+            self.k_state[:] = new_k.to(torch.float16)
+            self.v_state[:] = new_v.to(torch.float16)
+        
+        elif self.phase4_pattern == "slice_assign_no_cast":
+            # Slice assignment without explicit cast (trust buffer dtype)
+            new_angle = feats_detached_angle * alpha + self.angle_state * (1.0 - alpha)
+            new_k = feats_detached_k * alpha + self.k_state * (1.0 - alpha)
+            new_v = feats_detached_v * alpha + self.v_state * (1.0 - alpha)
+            
+            self.angle_state[:] = new_angle
+            self.k_state[:] = new_k
+            self.v_state[:] = new_v
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -303,7 +452,46 @@ class StatefulMobileNet(nn.Module):
         feats = self.proj(feats)                        # (B, feature_dim)
 
         # ── STATE UPDATE (EMA) ────────────────────────────────────────────
-        if self.phase2:
+        if self.phase3:
+            # Phase 3: Multiple state buffers — each with EMA update derived from features
+            # Project features to each state dimension
+            angle_feats_flat = self.angle_proj(feats)   # (B, 8*16)
+            angle_feats = angle_feats_flat.view(1, 8, 16)  # (1, 8, 16)
+            
+            k_feats_flat = self.k_proj(feats)           # (B, 1*8*64)
+            k_feats = k_feats_flat.view(1, 1, 8, 64)    # (1, 1, 8, 64)
+            
+            v_feats_flat = self.v_proj(feats)           # (B, 8*64)
+            v_feats = v_feats_flat.view(1, 8, 64)       # (1, 8, 64)
+            
+            # For Phase 4, apply the specified state write pattern
+            if self.phase4:
+                self._update_states_phase4(angle_feats, k_feats, v_feats)
+            else:
+                # Phase 3 baseline: EMA updates in-place
+                self.angle_state.mul_(1.0 - self.ema_alpha).add_(
+                    angle_feats.detach() * self.ema_alpha
+                )
+                self.k_state.mul_(1.0 - self.ema_alpha).add_(
+                    k_feats.detach() * self.ema_alpha
+                )
+                self.v_state.mul_(1.0 - self.ema_alpha).add_(
+                    v_feats.detach() * self.ema_alpha
+                )
+            
+            # For fusion, use simple sum of state global norms (since shapes differ)
+            state_norm = (
+                self.angle_state.norm().detach() +
+                self.k_state.norm().detach() +
+                self.v_state.norm().detach()
+            )
+            if self.num_states >= 4:
+                state_norm = state_norm + self.dv_state.norm().detach()
+            
+            # Broadcast state_norm to (1, feature_dim) for fusion
+            state_contribution = torch.ones(1, self.feature_dim, device=feats.device) * (state_norm / self.num_states)
+            fused = feats + state_contribution.detach()
+        elif self.phase2:
             # Phase 2: 4D state (1, nheads, headdim, d_state) where flatdim = feature_dim
             state_feats_flat = self.state_proj(feats)   # (B, feature_dim)
             state_feats = state_feats_flat.view(1, *self.state_shape[1:])  # (1, nheads, headdim, d_state)

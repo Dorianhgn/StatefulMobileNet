@@ -12,17 +12,31 @@ Features CoreML testées :
 Usage:
   python export.py
   python export.py --width 0.5 --classes 10 --no-verify
+  python export.py --backbone cnn --phase4 --phase4-pattern slice_assign_with_cast
 """
 
 import argparse
 import os
 import time
+import yaml
 
 import numpy as np
 import torch
 import coremltools as ct
 
 from model import StatefulMobileNet
+
+
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+def load_config(config_path: str = "phase4_config.yaml") -> dict:
+    """Load Phase 4 config from YAML if it exists, otherwise return empty dict."""
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            return yaml.safe_load(f) or {}
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +57,23 @@ def parse_args():
                    help="Image size — CNN / Hybrid only")
     p.add_argument("--phase2", action="store_true",
                    help="Enable Phase 2: 4D state (1, 8, 64, 64)")
+    p.add_argument("--phase3", action="store_true",
+                   help="Enable Phase 3: Multiple state buffers")
+    p.add_argument("--num-states", type=int, default=1,
+                   help="Number of states for Phase 3 (3 or 4)")
+    p.add_argument("--phase4", action="store_true",
+                   help="Enable Phase 4: Test different state write patterns")
+    p.add_argument("--phase4-pattern", type=str,
+                   default="slice_assign_with_cast",
+                   choices=[
+                       "addition",
+                       "mul",
+                       "copy",
+                       "clone",
+                       "slice_assign_with_cast",
+                       "slice_assign_no_cast",
+                   ],
+                   help="State write pattern for Phase 4")
     p.add_argument("--out-dir", default="./exported_model")
     p.add_argument("--no-verify", action="store_true",
                    help="Skip la vérification numérique")
@@ -55,6 +86,32 @@ def parse_args():
 
 def export(args):
     os.makedirs(args.out_dir, exist_ok=True)
+    
+    # Load Phase 4 config if it exists, CLI args override config values
+    config = load_config("phase4_config.yaml")
+    phase4_cfg = config.get("phase4", {})
+    
+    # Apply config values (but CLI args take precedence)
+    if args.phase4:
+        # When phase4 is passed via CLI, enable it
+        phase4_enabled = True
+        phase4_pattern = args.phase4_pattern
+        # Auto-enable Phase 2 and Phase 3
+        args.phase2 = True
+        args.phase3 = True
+        args.num_states = 3
+    elif phase4_cfg.get("enabled", False):
+        # Config file specifies phase4 enabled
+        args.phase4 = True
+        phase4_pattern = phase4_cfg.get("state_write_pattern", "slice_assign_with_cast")
+        args.phase4_pattern = phase4_pattern
+        # Auto-enable Phase 2 and Phase 3
+        phase3_cfg = phase4_cfg.get("phases_enabled", {})
+        args.phase2 = phase3_cfg.get("phase2", True)
+        args.phase3 = phase3_cfg.get("phase3", True)
+        args.num_states = phase3_cfg.get("num_states", 3)
+    else:
+        args.phase4 = False
 
     # Determine input shape based on backbone type
     if args.backbone == "mlp":
@@ -66,8 +123,17 @@ def export(args):
         input_name = "x"
 
     # 1. Instancier et préparer le modèle
+    phase_suffix = ""
+    phase4_suffix = ""
+    if args.phase4:
+        phase4_suffix = f" + Phase 4 ({args.phase4_pattern})"
+    if args.phase3:
+        phase_suffix = f" + Phase 3.{1 if args.num_states == 3 else 2} ({args.num_states} states)"
+    elif args.phase2:
+        phase_suffix = " + Phase 2"
+    
     if args.backbone == "mlp":
-        phase_label = "Phase 2" if args.phase2 else "Phase 1"
+        phase_label = f"Phase 1{phase_suffix}{phase4_suffix}"
         print(f"\n[1/5] Build StatefulMobileNet {phase_label} (MLP, input_dim={args.input_dim}, classes={args.classes})")
         model = StatefulMobileNet(
             num_classes=args.classes,
@@ -75,18 +141,26 @@ def export(args):
             input_dim=args.input_dim,
             ema_alpha=args.ema_alpha,
             phase2=args.phase2,
+            phase3=args.phase3,
+            num_states=args.num_states,
+            phase4=args.phase4,
+            phase4_pattern=args.phase4_pattern,
         )
     elif args.backbone == "hybrid":
-        phase_label = "Phase 2" if args.phase2 else "Phase 1.5"
+        phase_label = f"Phase 1.5{phase_suffix}{phase4_suffix}"
         print(f"\n[1/5] Build StatefulMobileNet {phase_label} (Hybrid CNN+MLP, classes={args.classes})")
         model = StatefulMobileNet(
             num_classes=args.classes,
             backbone_type="hybrid",
             ema_alpha=args.ema_alpha,
             phase2=args.phase2,
+            phase3=args.phase3,
+            num_states=args.num_states,
+            phase4=args.phase4,
+            phase4_pattern=args.phase4_pattern,
         )
     else:
-        phase_label = "Phase 2" if args.phase2 else "Phase 0"
+        phase_label = f"Phase 0{phase_suffix}{phase4_suffix}"
         print(f"\n[1/5] Build StatefulMobileNet {phase_label} (CNN, width={args.width}, classes={args.classes})")
         model = StatefulMobileNet(
             num_classes=args.classes,
@@ -94,19 +168,40 @@ def export(args):
             width_mult=args.width,
             ema_alpha=args.ema_alpha,
             phase2=args.phase2,
+            phase3=args.phase3,
+            num_states=args.num_states,
+            phase4=args.phase4,
+            phase4_pattern=args.phase4_pattern,
         )
     model.eval()
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"      Params: {n_params / 1e6:.2f}M")
     print(f"      Feature dim: {model.feature_dim}")
-    print(f"      State shape: {model.feature_state.shape}")
+    
+    if args.phase3:
+        print(f"      Phase 3 states: angle_state {model.angle_state.shape}, k_state {model.k_state.shape}, v_state {model.v_state.shape}", end="")
+        if args.num_states >= 4:
+            print(f", dv_state {model.dv_state.shape}")
+        else:
+            print()
+    else:
+        print(f"      State shape: {model.feature_state.shape}")
 
     # 2. Vérification du buffer (doit apparaître dans named_buffers)
     print("\n[2/5] Vérification des buffers TorchScript")
     buffers = dict(model.named_buffers())
-    assert "feature_state" in buffers, \
-        "ERROR: 'feature_state' absent de named_buffers() !"
+    
+    if args.phase3:
+        required_buffers = ["angle_state", "k_state", "v_state"]
+        if args.num_states >= 4:
+            required_buffers.append("dv_state")
+        for buf in required_buffers:
+            assert buf in buffers, f"ERROR: '{buf}' absent de named_buffers() !"
+    else:
+        assert "feature_state" in buffers, \
+            "ERROR: 'feature_state' absent de named_buffers() !"
+    
     print(f"      named_buffers: {list(buffers.keys())} ✓")
 
     # 3. Trace TorchScript
@@ -121,7 +216,53 @@ def export(args):
     print("      → convert_to=mlprogram")
     print("      → minimum_deployment_target=iOS18 (requis pour StateType)")
     print("      → compute_precision=FLOAT16 (ANE-friendly)")
-    print("      → states=[ct.StateType('feature_state')]")
+    
+    # Build states list
+    states_list = []
+    
+    if args.phase3:
+        # Phase 3: Use only angle, k, v (and dv if num_states >= 4)
+        states_list.append(
+            ct.StateType(
+                wrapped_type=ct.TensorType(shape=model.angle_state.shape),
+                name="angle_state",
+            )
+        )
+        states_list.append(
+            ct.StateType(
+                wrapped_type=ct.TensorType(shape=model.k_state.shape),
+                name="k_state",
+            )
+        )
+        states_list.append(
+            ct.StateType(
+                wrapped_type=ct.TensorType(shape=model.v_state.shape),
+                name="v_state",
+            )
+        )
+        if args.num_states >= 4:
+            states_list.append(
+                ct.StateType(
+                    wrapped_type=ct.TensorType(shape=model.dv_state.shape),
+                    name="dv_state",
+                )
+            )
+        print(f"      → states=[ct.StateType('angle_state'), ct.StateType('k_state'), ct.StateType('v_state')", end="")
+        if args.num_states >= 4:
+            print(", ct.StateType('dv_state')]")
+        else:
+            print("]")
+    else:
+        # Phase 0/1/2: Use feature_state
+        states_list.append(
+            ct.StateType(
+                wrapped_type=ct.TensorType(
+                    shape=model.feature_state.shape
+                ),
+                name="feature_state",  # DOIT matcher le nom du register_buffer
+            )
+        )
+        print("      → states=[ct.StateType('feature_state')]")
 
     t0 = time.time()
     mlmodel = ct.convert(
@@ -138,14 +279,7 @@ def export(args):
             ct.TensorType(name="logits", dtype=np.float32)
         ],
         # ── LE CŒUR DE CoreML 9.0 ──────────────────────────────────────
-        states=[
-            ct.StateType(
-                wrapped_type=ct.TensorType(
-                    shape=model.feature_state.shape
-                ),
-                name="feature_state",  # DOIT matcher le nom du register_buffer
-            )
-        ],
+        states=states_list,
         # ─────────────────────────────────────────────────────────────────
         minimum_deployment_target=ct.target.iOS18,
         compute_precision=ct.precision.FLOAT16,
@@ -154,17 +288,28 @@ def export(args):
     print(f"      Conversion OK ✓  ({dt_convert:.1f}s)")
 
     # Métadonnées
-    phase_label = "Phase 2" if args.phase2 else ""
-    state_desc = "4D state (1, 8, 64, 64)" if args.phase2 else "2D state (1, feature_dim)"
+    phase_desc = ""
+    if args.phase3:
+        phase_desc = f" + Phase 3.{1 if args.num_states == 3 else 2} ({args.num_states} states)"
+    elif args.phase2:
+        phase_desc = " + Phase 2"
+    
+    state_desc = ""
+    if args.phase3:
+        state_desc = f"Multiple states: angle (1,8,16), k (1,1,8,64), v (1,8,64)" + (", dv (1,8,64)" if args.num_states >= 4 else "")
+    elif args.phase2:
+        state_desc = "4D state (1, 8, 64, 64)"
+    else:
+        state_desc = "2D state (1, feature_dim)"
     
     if args.backbone == "mlp":
-        mlmodel.short_description = f"StatefulMobileNet Phase 1{' + Phase 2' if args.phase2 else ''} — MLP + EMA state ({state_desc}) (CoreML 9.0)"
+        mlmodel.short_description = f"StatefulMobileNet Phase 1{phase_desc} — MLP + EMA state ({state_desc}) (CoreML 9.0)"
         input_desc = f"Vector input ({args.input_dim}-dim)"
     elif args.backbone == "hybrid":
-        mlmodel.short_description = f"StatefulMobileNet Phase 1.5{' + Phase 2' if args.phase2 else ''} — Hybrid CNN+MLP + EMA state ({state_desc}) (CoreML 9.0)"
+        mlmodel.short_description = f"StatefulMobileNet Phase 1.5{phase_desc} — Hybrid CNN+MLP + EMA state ({state_desc}) (CoreML 9.0)"
         input_desc = f"RGB image (1, 3, {args.input_size}, {args.input_size}), float32"
     else:
-        mlmodel.short_description = f"StatefulMobileNet Phase 0{' + Phase 2' if args.phase2 else ''} — MobileNetV2 + EMA state ({state_desc}) (CoreML 9.0)"
+        mlmodel.short_description = f"StatefulMobileNet Phase 0{phase_desc} — MobileNetV2 + EMA state ({state_desc}) (CoreML 9.0)"
         input_desc = f"RGB image (1, 3, {args.input_size}, {args.input_size}), float32"
     
     mlmodel.author = "Dorian — test CoreML stateful API"
@@ -173,19 +318,29 @@ def export(args):
     mlmodel.output_description["logits"] = f"Class logits ({args.classes} classes)"
 
     # 5. Sauvegarde
-    phase2_suffix = "_Phase2_4Dstate" if args.phase2 else ""
+    phase_suffix = ""
+    if args.phase3:
+        phase_suffix = f"_Phase31_{args.num_states}states" if args.num_states == 3 else f"_Phase32_{args.num_states}states"
+    elif args.phase2:
+        phase_suffix = "_Phase2_4Dstate"
+    
+    # Phase 4 naming: append pattern name
+    phase4_suffix = ""
+    if args.phase4:
+        phase4_suffix = f"_Phase4_{args.phase4_pattern}"
+    
     if args.backbone == "mlp":
         model_name = (
-            f"StatefulMobileNet_Phase1_MLP_d{args.input_dim}_c{args.classes}_alpha{args.ema_alpha}{phase2_suffix}"
+            f"StatefulMobileNet_Phase1_MLP_d{args.input_dim}_c{args.classes}_alpha{args.ema_alpha}{phase_suffix}{phase4_suffix}"
         )
     elif args.backbone == "hybrid":
         model_name = (
-            f"StatefulMobileNet_Phase15_Hybrid_{args.input_size}x{args.input_size}_c{args.classes}_alpha{args.ema_alpha}{phase2_suffix}"
+            f"StatefulMobileNet_Phase15_Hybrid_{args.input_size}x{args.input_size}_c{args.classes}_alpha{args.ema_alpha}{phase_suffix}{phase4_suffix}"
         )
     else:
         model_name = (
             f"StatefulMobileNet_Phase0_w{args.width}_c{args.classes}"
-            f"_{args.input_size}x{args.input_size}_alpha{args.ema_alpha}{phase2_suffix}"
+            f"_{args.input_size}x{args.input_size}_alpha{args.ema_alpha}{phase_suffix}{phase4_suffix}"
         )
     out_path = os.path.join(args.out_dir, f"{model_name}.mlpackage")
     mlmodel.save(out_path)
@@ -208,7 +363,14 @@ def export(args):
         print("─" * 60)
 
         # Reset states
-        model.feature_state.zero_()
+        if args.phase3:
+            model.angle_state.zero_()
+            model.k_state.zero_()
+            model.v_state.zero_()
+            if args.num_states >= 4:
+                model.dv_state.zero_()
+        else:
+            model.feature_state.zero_()
 
         # Créer le state CoreML
         coreml_state = mlmodel.make_state()
@@ -252,7 +414,15 @@ def export(args):
     print("═" * 60)
     print(f"  Modèle    : {model_name}")
     print(f"  Format    : mlprogram (CoreML 9.0)")
-    print(f"  State     : feature_state {list(model.feature_state.shape)} — EMA α={args.ema_alpha}")
+    
+    if args.phase3:
+        state_summary = f"angle_state {list(model.angle_state.shape)}, k_state {list(model.k_state.shape)}, v_state {list(model.v_state.shape)}"
+        if args.num_states >= 4:
+            state_summary += f", dv_state {list(model.dv_state.shape)}"
+        print(f"  States    : {state_summary} — EMA α={args.ema_alpha}")
+    else:
+        print(f"  State     : feature_state {list(model.feature_state.shape)} — EMA α={args.ema_alpha}")
+    
     print(f"  Deployment: iOS18+ / macOS15+")
     print(f"  Précision : FLOAT16 (weights)")
     print(f"  Taille    : {total_size:.1f} MB")

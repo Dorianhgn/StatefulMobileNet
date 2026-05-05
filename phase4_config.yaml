@@ -1,0 +1,23 @@
+# Phase 4 Configuration — State Write Patterns Testing
+# This config controls Phase 4 behavior and is read by export.py and model.py
+
+phase4:
+  enabled: true
+  state_write_pattern: "slice_assign_with_cast"
+  # Available patterns:
+  #   "addition"                - new allocation: state = state + (1 - α) * features_proj
+  #   "mul"                     - in-place mul_.add_(): state.mul_(1-α).add_(features_proj * α)
+  #   "copy"                    - in-place copy_(): new_state.clone(); state.copy_(new_state)
+  #   "clone"                   - detach + clone: state = state.clone() + ...
+  #   "slice_assign_with_cast"  - explicit to(float16): state[:] = new_ssm.to(torch.float16)
+  #   "slice_assign_no_cast"    - no explicit cast: state[:] = new_ssm (trust buffer dtype)
+
+  phases_enabled:
+    phase2: true    # 4D state shape (1, 8, 64, 64)
+    phase3: true    # Multiple state buffers (3 states: angle, k, v)
+    num_states: 3   # 3 or 4 states for Phase 3
+
+# Backbones to use (Phase 4 is CNN and Hybrid only)
+backbones:
+  - cnn
+  - hybrid

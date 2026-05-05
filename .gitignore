@@ -223,3 +223,6 @@ __marimo__/
 exported_model/
 
 .DS_Store
+
+docs/
+bisect/

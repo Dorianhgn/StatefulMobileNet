@@ -1,0 +1,10 @@
+backbones:
+- cnn
+- hybrid
+phase4:
+  enabled: true
+  phases_enabled:
+    num_states: 3
+    phase2: true
+    phase3: true
+  state_write_pattern: clone
