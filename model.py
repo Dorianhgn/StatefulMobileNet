@@ -181,6 +181,8 @@ class StatefulMobileNet(nn.Module):
         num_states: int = 1,
         phase4: bool = False,
         phase4_pattern: str = "slice_assign_with_cast",
+        phase5: bool = False,
+        phase5_pattern: str = "matmul",
     ):
         super().__init__()
         self.ema_alpha = ema_alpha
@@ -191,6 +193,8 @@ class StatefulMobileNet(nn.Module):
         self.num_states = num_states
         self.phase4 = phase4
         self.phase4_pattern = phase4_pattern
+        self.phase5 = phase5
+        self.phase5_pattern = phase5_pattern
         
         # Phase 4 validation
         valid_patterns = [
@@ -207,8 +211,24 @@ class StatefulMobileNet(nn.Module):
                 f"Valid patterns: {valid_patterns}"
             )
         
+        # Phase 5 validation
+        valid_phase5_patterns = ["einsum", "matmul"]
+        if self.phase5 and self.phase5_pattern not in valid_phase5_patterns:
+            raise ValueError(
+                f"Invalid phase5_pattern '{self.phase5_pattern}'. "
+                f"Valid patterns: {valid_phase5_patterns}"
+            )
+        
+        # Phase 5: Auto-enable ALL previous phases (2, 3, 4) with optimal settings
+        if self.phase5:
+            self.phase2 = True
+            self.phase3 = True
+            self.phase4 = True
+            self.num_states = 3  # Phase 5 uses 3 states: angle, k, v
+            self.phase4_pattern = "mul"  # Use optimal pattern from Phase 4
+        
         # Phase 4: Auto-enable Phase 2 and Phase 3 with 3 states
-        if self.phase4:
+        elif self.phase4:
             self.phase2 = True
             self.phase3 = True
             self.num_states = 3  # Phase 4 uses 3 states: angle, k, v
@@ -335,7 +355,20 @@ class StatefulMobileNet(nn.Module):
                 )
                 self.state_shapes["dv_state"] = (1, 8, 64)
                 # Projection layer for dv_state
-                self.dv_proj = nn.Linear(self.feature_dim, 8 * 64)        # ──────────────────────────────────────────────────────────────────
+                self.dv_proj = nn.Linear(self.feature_dim, 8 * 64)
+            
+            # Phase 5: SSM state for Mamba-style outer product fusion
+            # ssm_state: (1, 8, 64, 64) = 32768 elements — the main fusion state
+            if self.phase5:
+                self.register_buffer(
+                    "ssm_state",
+                    torch.zeros(1, 8, 64, 64, dtype=torch.float32),
+                )
+                self.state_shapes["ssm_state"] = (1, 8, 64, 64)
+                # Scalars for trapezoid mixing (a, b, g coefficients)
+                self.register_buffer("a_coeff", torch.tensor(0.9, dtype=torch.float32))
+                self.register_buffer("b_coeff", torch.tensor(0.5, dtype=torch.float32))
+                self.register_buffer("g_coeff", torch.tensor(0.5, dtype=torch.float32))
 
         self._init_weights()
 
@@ -426,6 +459,81 @@ class StatefulMobileNet(nn.Module):
             self.k_state[:] = new_k
             self.v_state[:] = new_v
 
+    def _update_states_phase5(
+        self,
+        angle_feats: torch.Tensor,
+        k_feats: torch.Tensor,
+        v_feats: torch.Tensor,
+    ) -> None:
+        """
+        Phase 5: Mamba-style outer product state fusion using trapezoid rule.
+        
+        Computes outer products of V × K (previous and current) and blends them
+        with the SSM state using trapezoid mixing rule:
+            delta_h = b * outer_prev + g * outer_curr
+            new_h = a * ssm_state + delta_h
+        
+        Patterns:
+        - "einsum": torch.einsum("bhp,bhs->bhps", V, K)
+        - "matmul": torch.matmul(V.unsqueeze(-1), K.unsqueeze(-2))
+        
+        State shapes:
+        - ssm_state: (1, nheads=8, headdim=64, d_state=64)
+        - k_state: (1, 1, nheads=8, d_state=64) → squeezed to (1, 8, 64)
+        - v_state: (1, nheads=8, headdim=64)
+        """
+        # Extract the current step features
+        # V: (1, 8, 64) — current V from backbone
+        # K: (1, 1, 8, 64) → squeeze to (1, 8, 64) for current K
+        V = v_feats.detach()  # (1, 8, 64)
+        K = k_feats.detach().squeeze(1)  # (1, 1, 8, 64) → (1, 8, 64)
+        
+        # Previous step features from state
+        Vp = self.v_state.detach()  # (1, 8, 64)
+        Kp = self.k_state.detach().squeeze(1)  # (1, 1, 8, 64) → (1, 8, 64)
+        
+        # === OUTER PRODUCT COMPUTATION ===
+        # Option 1: einsum-based (user can add .float() after each tensor if needed for precision)
+        # Option 2: matmul-based (vectorized unsqueeze)
+        
+        if self.phase5_pattern == "einsum":
+            # Use torch.einsum for outer product: (B, H, P) x (B, H, S) → (B, H, P, S)
+            # Note: If precision issues arise, add .float() after V, K, Vp, Kp above
+            outer_prev = torch.einsum("bhp,bhs->bhps", Vp, Kp)  # (1, 8, 64, 64)
+            outer_curr = torch.einsum("bhp,bhs->bhps", V, K)    # (1, 8, 64, 64)
+        
+        elif self.phase5_pattern == "matmul":
+            # Alternative: torch.matmul with unsqueeze
+            # Shapes: V.unsqueeze(-1) = (1, 8, 64, 1), K.unsqueeze(-2) = (1, 8, 1, 64)
+            # Note: If precision issues arise, add .float() after V, K, Vp, Kp above
+            outer_prev = torch.matmul(
+                Vp.unsqueeze(-1),  # (1, 8, 64, 1)
+                Kp.unsqueeze(-2),  # (1, 8, 1, 64)
+            )  # → (1, 8, 64, 64)
+            outer_curr = torch.matmul(
+                V.unsqueeze(-1),   # (1, 8, 64, 1)
+                K.unsqueeze(-2),   # (1, 8, 1, 64)
+            )  # → (1, 8, 64, 64)
+        
+        else:
+            raise ValueError(f"Unknown phase5_pattern: {self.phase5_pattern}")
+        
+        # === TRAPEZOID MIXING RULE ===
+        # delta_h = b * outer_prev + g * outer_curr
+        # new_h = a * ssm_state + delta_h
+        # Note: If precision issues arise, add .float() before / after operations:
+        #   delta_h = self.b_coeff.float() * outer_prev.float() + ...
+        delta_h = self.b_coeff * outer_prev + self.g_coeff * outer_curr  # (1, 8, 64, 64)
+        new_h = self.a_coeff * self.ssm_state + delta_h  # (1, 8, 64, 64)
+        
+        # === STATE UPDATE (in-place, using Phase 4 "mul" pattern) ===
+        # mul_.add_() for minimal CoreML overhead
+        self.ssm_state.mul_(1.0 - self.ema_alpha).add_(new_h * self.ema_alpha)
+        
+        # Also update k_state and v_state with Phase 4 "mul" pattern (in-place)
+        self.k_state.mul_(1.0 - self.ema_alpha).add_(k_feats.detach() * self.ema_alpha)
+        self.v_state.mul_(1.0 - self.ema_alpha).add_(v_feats.detach() * self.ema_alpha)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -464,8 +572,11 @@ class StatefulMobileNet(nn.Module):
             v_feats_flat = self.v_proj(feats)           # (B, 8*64)
             v_feats = v_feats_flat.view(1, 8, 64)       # (1, 8, 64)
             
+            # For Phase 5, apply Mamba-style outer product fusion
+            if self.phase5:
+                self._update_states_phase5(angle_feats, k_feats, v_feats)
             # For Phase 4, apply the specified state write pattern
-            if self.phase4:
+            elif self.phase4:
                 self._update_states_phase4(angle_feats, k_feats, v_feats)
             else:
                 # Phase 3 baseline: EMA updates in-place
@@ -488,8 +599,12 @@ class StatefulMobileNet(nn.Module):
             if self.num_states >= 4:
                 state_norm = state_norm + self.dv_state.norm().detach()
             
+            # Phase 5: Include ssm_state in fusion
+            if self.phase5:
+                state_norm = state_norm + self.ssm_state.norm().detach()
+            
             # Broadcast state_norm to (1, feature_dim) for fusion
-            state_contribution = torch.ones(1, self.feature_dim, device=feats.device) * (state_norm / self.num_states)
+            state_contribution = torch.ones(1, self.feature_dim, device=feats.device) * (state_norm / (self.num_states + (1 if self.phase5 else 0)))
             fused = feats + state_contribution.detach()
         elif self.phase2:
             # Phase 2: 4D state (1, nheads, headdim, d_state) where flatdim = feature_dim

@@ -74,6 +74,12 @@ def parse_args():
                        "slice_assign_no_cast",
                    ],
                    help="State write pattern for Phase 4")
+    p.add_argument("--phase5", action="store_true",
+                   help="Enable Phase 5: Mamba-style outer product state fusion")
+    p.add_argument("--phase5-pattern", type=str,
+                   default="matmul",
+                   choices=["einsum", "matmul"],
+                   help="Outer product pattern for Phase 5 (einsum or matmul-based)")
     p.add_argument("--out-dir", default="./exported_model")
     p.add_argument("--no-verify", action="store_true",
                    help="Skip la vérification numérique")
@@ -92,7 +98,14 @@ def export(args):
     phase4_cfg = config.get("phase4", {})
     
     # Apply config values (but CLI args take precedence)
-    if args.phase4:
+    if args.phase5:
+        # When phase5 is passed via CLI, enable it (auto-enables 2, 3, 4)
+        args.phase2 = True
+        args.phase3 = True
+        args.phase4 = True
+        args.num_states = 3
+        args.phase4_pattern = "mul"  # Phase 5 uses optimal Phase 4 pattern
+    elif args.phase4:
         # When phase4 is passed via CLI, enable it
         phase4_enabled = True
         phase4_pattern = args.phase4_pattern
@@ -125,7 +138,10 @@ def export(args):
     # 1. Instancier et préparer le modèle
     phase_suffix = ""
     phase4_suffix = ""
-    if args.phase4:
+    phase5_suffix = ""
+    if args.phase5:
+        phase5_suffix = f" + Phase 5 ({args.phase5_pattern})"
+    elif args.phase4:
         phase4_suffix = f" + Phase 4 ({args.phase4_pattern})"
     if args.phase3:
         phase_suffix = f" + Phase 3.{1 if args.num_states == 3 else 2} ({args.num_states} states)"
@@ -133,7 +149,7 @@ def export(args):
         phase_suffix = " + Phase 2"
     
     if args.backbone == "mlp":
-        phase_label = f"Phase 1{phase_suffix}{phase4_suffix}"
+        phase_label = f"Phase 1{phase_suffix}{phase4_suffix}{phase5_suffix}"
         print(f"\n[1/5] Build StatefulMobileNet {phase_label} (MLP, input_dim={args.input_dim}, classes={args.classes})")
         model = StatefulMobileNet(
             num_classes=args.classes,
@@ -145,9 +161,11 @@ def export(args):
             num_states=args.num_states,
             phase4=args.phase4,
             phase4_pattern=args.phase4_pattern,
+            phase5=args.phase5,
+            phase5_pattern=args.phase5_pattern,
         )
     elif args.backbone == "hybrid":
-        phase_label = f"Phase 1.5{phase_suffix}{phase4_suffix}"
+        phase_label = f"Phase 1.5{phase_suffix}{phase4_suffix}{phase5_suffix}"
         print(f"\n[1/5] Build StatefulMobileNet {phase_label} (Hybrid CNN+MLP, classes={args.classes})")
         model = StatefulMobileNet(
             num_classes=args.classes,
@@ -158,9 +176,11 @@ def export(args):
             num_states=args.num_states,
             phase4=args.phase4,
             phase4_pattern=args.phase4_pattern,
+            phase5=args.phase5,
+            phase5_pattern=args.phase5_pattern,
         )
     else:
-        phase_label = f"Phase 0{phase_suffix}{phase4_suffix}"
+        phase_label = f"Phase 0{phase_suffix}{phase4_suffix}{phase5_suffix}"
         print(f"\n[1/5] Build StatefulMobileNet {phase_label} (CNN, width={args.width}, classes={args.classes})")
         model = StatefulMobileNet(
             num_classes=args.classes,
@@ -172,6 +192,8 @@ def export(args):
             num_states=args.num_states,
             phase4=args.phase4,
             phase4_pattern=args.phase4_pattern,
+            phase5=args.phase5,
+            phase5_pattern=args.phase5_pattern,
         )
     model.eval()
 
@@ -182,7 +204,9 @@ def export(args):
     if args.phase3:
         print(f"      Phase 3 states: angle_state {model.angle_state.shape}, k_state {model.k_state.shape}, v_state {model.v_state.shape}", end="")
         if args.num_states >= 4:
-            print(f", dv_state {model.dv_state.shape}")
+            print(f", dv_state {model.dv_state.shape}", end="")
+        if args.phase5:
+            print(f", ssm_state {model.ssm_state.shape}")
         else:
             print()
     else:
@@ -247,9 +271,19 @@ def export(args):
                     name="dv_state",
                 )
             )
+        # Phase 5: Add ssm_state
+        if args.phase5:
+            states_list.append(
+                ct.StateType(
+                    wrapped_type=ct.TensorType(shape=model.ssm_state.shape),
+                    name="ssm_state",
+                )
+            )
         print(f"      → states=[ct.StateType('angle_state'), ct.StateType('k_state'), ct.StateType('v_state')", end="")
         if args.num_states >= 4:
-            print(", ct.StateType('dv_state')]")
+            print(", ct.StateType('dv_state')", end="")
+        if args.phase5:
+            print(", ct.StateType('ssm_state')]")
         else:
             print("]")
     else:
