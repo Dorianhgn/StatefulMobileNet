@@ -41,6 +41,8 @@ def parse_args():
     p.add_argument("--ema-alpha", type=float, default=0.1)
     p.add_argument("--input-size", type=int, default=224,
                    help="Image size — CNN / Hybrid only")
+    p.add_argument("--phase2", action="store_true",
+                   help="Enable Phase 2: 4D state (1, 8, 64, 64)")
     p.add_argument("--out-dir", default="./exported_model")
     p.add_argument("--no-verify", action="store_true",
                    help="Skip la vérification numérique")
@@ -65,27 +67,33 @@ def export(args):
 
     # 1. Instancier et préparer le modèle
     if args.backbone == "mlp":
-        print(f"\n[1/5] Build StatefulMobileNet Phase 1 (MLP, input_dim={args.input_dim}, classes={args.classes})")
+        phase_label = "Phase 2" if args.phase2 else "Phase 1"
+        print(f"\n[1/5] Build StatefulMobileNet {phase_label} (MLP, input_dim={args.input_dim}, classes={args.classes})")
         model = StatefulMobileNet(
             num_classes=args.classes,
             backbone_type="mlp",
             input_dim=args.input_dim,
             ema_alpha=args.ema_alpha,
+            phase2=args.phase2,
         )
     elif args.backbone == "hybrid":
-        print(f"\n[1/5] Build StatefulMobileNet Phase 1.5 (Hybrid CNN+MLP, classes={args.classes})")
+        phase_label = "Phase 2" if args.phase2 else "Phase 1.5"
+        print(f"\n[1/5] Build StatefulMobileNet {phase_label} (Hybrid CNN+MLP, classes={args.classes})")
         model = StatefulMobileNet(
             num_classes=args.classes,
             backbone_type="hybrid",
             ema_alpha=args.ema_alpha,
+            phase2=args.phase2,
         )
     else:
-        print(f"\n[1/5] Build StatefulMobileNet Phase 0 (CNN, width={args.width}, classes={args.classes})")
+        phase_label = "Phase 2" if args.phase2 else "Phase 0"
+        print(f"\n[1/5] Build StatefulMobileNet {phase_label} (CNN, width={args.width}, classes={args.classes})")
         model = StatefulMobileNet(
             num_classes=args.classes,
             backbone_type="cnn",
             width_mult=args.width,
             ema_alpha=args.ema_alpha,
+            phase2=args.phase2,
         )
     model.eval()
 
@@ -133,7 +141,7 @@ def export(args):
         states=[
             ct.StateType(
                 wrapped_type=ct.TensorType(
-                    shape=(1, model.feature_dim)
+                    shape=model.feature_state.shape
                 ),
                 name="feature_state",  # DOIT matcher le nom du register_buffer
             )
@@ -146,14 +154,17 @@ def export(args):
     print(f"      Conversion OK ✓  ({dt_convert:.1f}s)")
 
     # Métadonnées
+    phase_label = "Phase 2" if args.phase2 else ""
+    state_desc = "4D state (1, 8, 64, 64)" if args.phase2 else "2D state (1, feature_dim)"
+    
     if args.backbone == "mlp":
-        mlmodel.short_description = "StatefulMobileNet Phase 1 — MLP + EMA state (CoreML 9.0)"
+        mlmodel.short_description = f"StatefulMobileNet Phase 1{' + Phase 2' if args.phase2 else ''} — MLP + EMA state ({state_desc}) (CoreML 9.0)"
         input_desc = f"Vector input ({args.input_dim}-dim)"
     elif args.backbone == "hybrid":
-        mlmodel.short_description = "StatefulMobileNet Phase 1.5 — Hybrid CNN+MLP + EMA state (CoreML 9.0)"
+        mlmodel.short_description = f"StatefulMobileNet Phase 1.5{' + Phase 2' if args.phase2 else ''} — Hybrid CNN+MLP + EMA state ({state_desc}) (CoreML 9.0)"
         input_desc = f"RGB image (1, 3, {args.input_size}, {args.input_size}), float32"
     else:
-        mlmodel.short_description = "StatefulMobileNet Phase 0 — MobileNetV2 + EMA state (CoreML 9.0)"
+        mlmodel.short_description = f"StatefulMobileNet Phase 0{' + Phase 2' if args.phase2 else ''} — MobileNetV2 + EMA state ({state_desc}) (CoreML 9.0)"
         input_desc = f"RGB image (1, 3, {args.input_size}, {args.input_size}), float32"
     
     mlmodel.author = "Dorian — test CoreML stateful API"
@@ -162,18 +173,19 @@ def export(args):
     mlmodel.output_description["logits"] = f"Class logits ({args.classes} classes)"
 
     # 5. Sauvegarde
+    phase2_suffix = "_Phase2_4Dstate" if args.phase2 else ""
     if args.backbone == "mlp":
         model_name = (
-            f"StatefulMobileNet_Phase1_MLP_d{args.input_dim}_c{args.classes}_alpha{args.ema_alpha}"
+            f"StatefulMobileNet_Phase1_MLP_d{args.input_dim}_c{args.classes}_alpha{args.ema_alpha}{phase2_suffix}"
         )
     elif args.backbone == "hybrid":
         model_name = (
-            f"StatefulMobileNet_Phase15_Hybrid_{args.input_size}x{args.input_size}_c{args.classes}_alpha{args.ema_alpha}"
+            f"StatefulMobileNet_Phase15_Hybrid_{args.input_size}x{args.input_size}_c{args.classes}_alpha{args.ema_alpha}{phase2_suffix}"
         )
     else:
         model_name = (
             f"StatefulMobileNet_Phase0_w{args.width}_c{args.classes}"
-            f"_{args.input_size}x{args.input_size}_alpha{args.ema_alpha}"
+            f"_{args.input_size}x{args.input_size}_alpha{args.ema_alpha}{phase2_suffix}"
         )
     out_path = os.path.join(args.out_dir, f"{model_name}.mlpackage")
     mlmodel.save(out_path)

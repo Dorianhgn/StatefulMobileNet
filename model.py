@@ -165,6 +165,7 @@ class StatefulMobileNet(nn.Module):
         feature_dim: dimension du vecteur de features global (après GAP)
         backbone_type: "cnn" (Phase 0), "mlp" (Phase 1), "hybrid" (Phase 1.5)
         input_dim:   pour MLP, dimension d'entrée vectorielle
+        phase2:      si True, reshape feature_state en 4D (1, nheads, headdim, d_state)
     """
 
     def __init__(
@@ -175,11 +176,13 @@ class StatefulMobileNet(nn.Module):
         feature_dim: int | None = None,
         backbone_type: str = "cnn",
         input_dim: int = 256,
+        phase2: bool = False,
     ):
         super().__init__()
         self.ema_alpha = ema_alpha
         self.backbone_type = backbone_type
         self.input_dim = input_dim
+        self.phase2 = phase2
 
         # Backbone
         if backbone_type == "cnn":
@@ -213,6 +216,32 @@ class StatefulMobileNet(nn.Module):
         else:
             self.proj = nn.Identity()
 
+        # Phase 2: Projection vers 4D state (1, nheads, headdim, d_state)
+        # Contrainte: nheads * headdim * d_state = feature_dim (pour que la fusion soit possible)
+        # Exemple: feature_dim=1280 → (1, 8, 20, 8) = 8*20*8 = 1280
+        #          feature_dim=512  → (1, 8, 8, 8) = 8*8*8 = 512
+        if self.phase2:
+            state_nheads = 8
+            d_inner = self.feature_dim // state_nheads  # e.g., 1280 / 8 = 160 or 512 / 8 = 64
+            
+            # Factorize d_inner into headdim * d_state
+            # Simple heuristic: try to balance them
+            state_headdim = int(d_inner ** 0.5)  # approx sqrt
+            # Round to nearest divisor
+            while d_inner % state_headdim != 0:
+                state_headdim -= 1
+            state_dstate = d_inner // state_headdim
+            
+            # Validation
+            assert state_headdim * state_dstate == d_inner, \
+                f"headdim*d_state ({state_headdim}*{state_dstate}) must equal feature_dim/nheads ({d_inner})"
+            
+            self.state_shape = (1, state_nheads, state_headdim, state_dstate)
+            self.state_flatdim = self.feature_dim  # Keep same as feature_dim for fusion
+            self.state_proj = nn.Identity()  # No projection needed
+        else:
+            self.state_shape = (1, self.feature_dim)
+
         # Classifier
         self.dropout = nn.Dropout(0.2)
         self.classifier = nn.Linear(self.feature_dim, num_classes)
@@ -220,10 +249,17 @@ class StatefulMobileNet(nn.Module):
         # ── STATE ──────────────────────────────────────────────────────────
         # register_buffer → persistant dans le modèle, traceable par TorchScript
         # Nom "feature_state" = celui qu'on passera à ct.StateType(name=...)
-        self.register_buffer(
-            "feature_state",
-            torch.zeros(1, self.feature_dim, dtype=torch.float32),
-        )
+        # Phase 2: shape 4D (1, 8, 64, 64) ; Phase 1/0: shape 2D (1, feature_dim)
+        if self.phase2:
+            self.register_buffer(
+                "feature_state",
+                torch.zeros(*self.state_shape, dtype=torch.float32),
+            )
+        else:
+            self.register_buffer(
+                "feature_state",
+                torch.zeros(1, self.feature_dim, dtype=torch.float32),
+            )
         # ──────────────────────────────────────────────────────────────────
 
         self._init_weights()
@@ -267,15 +303,28 @@ class StatefulMobileNet(nn.Module):
         feats = self.proj(feats)                        # (B, feature_dim)
 
         # ── STATE UPDATE (EMA) ────────────────────────────────────────────
-        # Mise à jour in-place du buffer — c'est ce que CoreML intercepte
-        # pour gérer le state entre les appels à predict()
-        self.feature_state.mul_(1.0 - self.ema_alpha).add_(
-            feats.detach() * self.ema_alpha
-        )
+        if self.phase2:
+            # Phase 2: 4D state (1, nheads, headdim, d_state) where flatdim = feature_dim
+            state_feats_flat = self.state_proj(feats)   # (B, feature_dim)
+            state_feats = state_feats_flat.view(1, *self.state_shape[1:])  # (1, nheads, headdim, d_state)
+            
+            # EMA update in-place on 4D state
+            self.feature_state.mul_(1.0 - self.ema_alpha).add_(
+                state_feats.detach() * self.ema_alpha
+            )
+            
+            # For classifier, reshape state back to 2D for fusion
+            state_global = self.feature_state.reshape(1, -1)  # (1, feature_dim)
+            fused = feats + state_global
+        else:
+            # Phase 0/1: 2D state (1, feature_dim)
+            # Mise à jour in-place du buffer — c'est ce que CoreML intercepte
+            # pour gérer le state entre les appels à predict()
+            self.feature_state.mul_(1.0 - self.ema_alpha).add_(
+                feats.detach() * self.ema_alpha
+            )
+            fused = feats + self.feature_state          # simple addition — pas de grad leak
         # ──────────────────────────────────────────────────────────────────
-
-        # Fusion features courantes + état accumulé
-        fused = feats + self.feature_state          # simple addition — pas de grad leak
 
         # Classification
         out = self.dropout(fused)
