@@ -17,6 +17,57 @@ import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
+# Phase 1: MLP Backbone
+# ---------------------------------------------------------------------------
+
+class MLPBackbone(nn.Module):
+    """Simple MLP backbone for Phase 1 testing — linear layers + SiLU."""
+    def __init__(self, input_dim: int = 256, hidden_dim: int = 512, output_dim: int = 512):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, input_dim)
+        return self.mlp(x)  # (B, output_dim)
+
+
+class HybridBackbone(nn.Module):
+    """Hybrid backbone: CNN + MLP for increased ANE workload."""
+    def __init__(self, in_channels: int = 3, hidden_dim: int = 256, output_dim: int = 512):
+        super().__init__()
+        # Lightweight CNN: 2 conv blocks
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=5, stride=2, padding=2, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=5, stride=2, padding=2, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU6(inplace=True),
+        )
+        # MLP: 2 layers
+        self.mlp = nn.Sequential(
+            nn.Linear(128, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, 3, H, W)
+        x = self.conv(x)                        # (B, 128, H/4, W/4)
+        x = F.adaptive_avg_pool2d(x, 1)         # (B, 128, 1, 1)
+        x = x.flatten(1)                        # (B, 128)
+        x = self.mlp(x)                         # (B, output_dim)
+        return x
+
+
+
+# ---------------------------------------------------------------------------
 # Blocs de base MobileNetV2
 # ---------------------------------------------------------------------------
 
@@ -112,6 +163,8 @@ class StatefulMobileNet(nn.Module):
         width_mult:  facteur de largeur MobileNetV2 (0.5, 0.75, 1.0...)
         ema_alpha:   coefficient EMA (0 = état figé, 1 = pas de mémoire)
         feature_dim: dimension du vecteur de features global (après GAP)
+        backbone_type: "cnn" (Phase 0), "mlp" (Phase 1), "hybrid" (Phase 1.5)
+        input_dim:   pour MLP, dimension d'entrée vectorielle
     """
 
     def __init__(
@@ -120,12 +173,38 @@ class StatefulMobileNet(nn.Module):
         width_mult: float = 1.0,
         ema_alpha: float = 0.1,
         feature_dim: int | None = None,
+        backbone_type: str = "cnn",
+        input_dim: int = 256,
     ):
         super().__init__()
         self.ema_alpha = ema_alpha
+        self.backbone_type = backbone_type
+        self.input_dim = input_dim
 
         # Backbone
-        self.backbone, last_ch = _make_backbone(width_mult)
+        if backbone_type == "cnn":
+            self.backbone, last_ch = _make_backbone(width_mult)
+        elif backbone_type == "mlp":
+            # Phase 1: MLP backend
+            hidden_dim = 512
+            self.backbone = MLPBackbone(
+                input_dim=input_dim,
+                hidden_dim=hidden_dim,
+                output_dim=hidden_dim,
+            )
+            last_ch = hidden_dim
+        elif backbone_type == "hybrid":
+            # Phase 1.5: CNN + MLP (higher ANE workload)
+            hidden_dim = 256
+            output_dim = 512
+            self.backbone = HybridBackbone(
+                in_channels=3,
+                hidden_dim=hidden_dim,
+                output_dim=output_dim,
+            )
+            last_ch = output_dim
+        else:
+            raise ValueError(f"Unknown backbone_type: {backbone_type}")
 
         # Projection vers feature_dim si spécifié
         self.feature_dim = feature_dim or last_ch
@@ -165,7 +244,10 @@ class StatefulMobileNet(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: image tensor (B, 3, H, W) — B=1 pour l'inférence stateful
+            x: input tensor
+               - CNN mode: image (B, 3, H, W)
+               - MLP mode: vector (B, input_dim)
+               - Hybrid mode: image (B, 3, H, W)
 
         Returns:
             logits: (B, num_classes)
@@ -174,11 +256,15 @@ class StatefulMobileNet(nn.Module):
             self.feature_state mis à jour in-place (EMA)
             → CoreML lit/écrit automatiquement l'état entre les prédictions
         """
-        # Backbone + Global Average Pooling
-        feats = self.backbone(x)                    # (B, last_ch, h, w)
-        feats = F.adaptive_avg_pool2d(feats, 1)     # (B, last_ch, 1, 1)
-        feats = feats.flatten(1)                    # (B, last_ch)
-        feats = self.proj(feats)                    # (B, feature_dim)
+        # Backbone
+        if self.backbone_type == "cnn":
+            feats = self.backbone(x)                    # (B, last_ch, h, w)
+            feats = F.adaptive_avg_pool2d(feats, 1)     # (B, last_ch, 1, 1)
+            feats = feats.flatten(1)                    # (B, last_ch)
+        elif self.backbone_type in ["mlp", "hybrid"]:
+            feats = self.backbone(x)                    # already (B, hidden_dim)
+
+        feats = self.proj(feats)                        # (B, feature_dim)
 
         # ── STATE UPDATE (EMA) ────────────────────────────────────────────
         # Mise à jour in-place du buffer — c'est ce que CoreML intercepte
@@ -203,10 +289,39 @@ class StatefulMobileNet(nn.Module):
 
 if __name__ == "__main__":
     import time
+    import sys
 
     print("=== StatefulMobileNet — PyTorch sanity check ===\n")
 
-    model = StatefulMobileNet(num_classes=1000, width_mult=1.0, ema_alpha=0.1)
+    backbone_type = sys.argv[1] if len(sys.argv) > 1 else "cnn"
+    
+    if backbone_type == "mlp":
+        model = StatefulMobileNet(
+            num_classes=1000,
+            backbone_type="mlp",
+            input_dim=256,
+            ema_alpha=0.1
+        )
+        input_shape = (1, 256)
+        print(f"Backbone: MLP (Phase 1)")
+    elif backbone_type == "hybrid":
+        model = StatefulMobileNet(
+            num_classes=1000,
+            backbone_type="hybrid",
+            ema_alpha=0.1
+        )
+        input_shape = (1, 3, 224, 224)
+        print(f"Backbone: Hybrid CNN+MLP (Phase 1.5)")
+    else:
+        model = StatefulMobileNet(
+            num_classes=1000,
+            width_mult=1.0,
+            backbone_type="cnn",
+            ema_alpha=0.1
+        )
+        input_shape = (1, 3, 224, 224)
+        print(f"Backbone: CNN (Phase 0)")
+
     model.eval()
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -216,9 +331,9 @@ if __name__ == "__main__":
     print(f"State shape: {model.feature_state.shape}\n")
 
     # Simulate 5 frames consécutives
-    print("Simulation 5 frames (224x224):")
+    print("Simulation 5 frames:")
     for i in range(5):
-        x = torch.rand(1, 3, 224, 224)
+        x = torch.rand(*input_shape)
         t0 = time.time()
         with torch.no_grad():
             logits = model(x)

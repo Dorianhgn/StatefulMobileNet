@@ -221,3 +221,5 @@ __marimo__/
 
 # mltools
 exported_model/
+
+.DS_Store

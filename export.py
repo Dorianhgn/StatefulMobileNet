@@ -31,14 +31,19 @@ from model import StatefulMobileNet
 
 def parse_args():
     p = argparse.ArgumentParser()
+    p.add_argument("--backbone", type=str, default="cnn", choices=["cnn", "mlp", "hybrid"],
+                   help="Backbone type: 'cnn' (Phase 0), 'mlp' (Phase 1), 'hybrid' (Phase 1.5)")
     p.add_argument("--width", type=float, default=1.0,
-                   help="width_mult MobileNetV2 (0.5 / 0.75 / 1.0)")
+                   help="width_mult MobileNetV2 (0.5 / 0.75 / 1.0) — CNN only")
+    p.add_argument("--input-dim", type=int, default=256,
+                   help="Input dimension for MLP — MLP only")
     p.add_argument("--classes", type=int, default=1000)
     p.add_argument("--ema-alpha", type=float, default=0.1)
-    p.add_argument("--input-size", type=int, default=224)
+    p.add_argument("--input-size", type=int, default=224,
+                   help="Image size — CNN / Hybrid only")
     p.add_argument("--out-dir", default="./exported_model")
     p.add_argument("--no-verify", action="store_true",
-                   help="Skipe la vérification numérique")
+                   help="Skip la vérification numérique")
     return p.parse_args()
 
 
@@ -49,16 +54,39 @@ def parse_args():
 def export(args):
     os.makedirs(args.out_dir, exist_ok=True)
 
-    H = W = args.input_size
-    shape = (1, 3, H, W)
+    # Determine input shape based on backbone type
+    if args.backbone == "mlp":
+        shape = (1, args.input_dim)
+        input_name = "x_vec"
+    else:  # cnn or hybrid
+        H = W = args.input_size
+        shape = (1, 3, H, W)
+        input_name = "x"
 
     # 1. Instancier et préparer le modèle
-    print(f"\n[1/5] Build StatefulMobileNet (width={args.width}, classes={args.classes})")
-    model = StatefulMobileNet(
-        num_classes=args.classes,
-        width_mult=args.width,
-        ema_alpha=args.ema_alpha,
-    )
+    if args.backbone == "mlp":
+        print(f"\n[1/5] Build StatefulMobileNet Phase 1 (MLP, input_dim={args.input_dim}, classes={args.classes})")
+        model = StatefulMobileNet(
+            num_classes=args.classes,
+            backbone_type="mlp",
+            input_dim=args.input_dim,
+            ema_alpha=args.ema_alpha,
+        )
+    elif args.backbone == "hybrid":
+        print(f"\n[1/5] Build StatefulMobileNet Phase 1.5 (Hybrid CNN+MLP, classes={args.classes})")
+        model = StatefulMobileNet(
+            num_classes=args.classes,
+            backbone_type="hybrid",
+            ema_alpha=args.ema_alpha,
+        )
+    else:
+        print(f"\n[1/5] Build StatefulMobileNet Phase 0 (CNN, width={args.width}, classes={args.classes})")
+        model = StatefulMobileNet(
+            num_classes=args.classes,
+            backbone_type="cnn",
+            width_mult=args.width,
+            ema_alpha=args.ema_alpha,
+        )
     model.eval()
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -93,7 +121,7 @@ def export(args):
         convert_to="mlprogram",
         inputs=[
             ct.TensorType(
-                name="x",
+                name=input_name,
                 shape=shape,
                 dtype=np.float32,
             )
@@ -118,17 +146,35 @@ def export(args):
     print(f"      Conversion OK ✓  ({dt_convert:.1f}s)")
 
     # Métadonnées
-    mlmodel.short_description = "StatefulMobileNet — MobileNetV2 + EMA state (CoreML 9.0)"
+    if args.backbone == "mlp":
+        mlmodel.short_description = "StatefulMobileNet Phase 1 — MLP + EMA state (CoreML 9.0)"
+        input_desc = f"Vector input ({args.input_dim}-dim)"
+    elif args.backbone == "hybrid":
+        mlmodel.short_description = "StatefulMobileNet Phase 1.5 — Hybrid CNN+MLP + EMA state (CoreML 9.0)"
+        input_desc = f"RGB image (1, 3, {args.input_size}, {args.input_size}), float32"
+    else:
+        mlmodel.short_description = "StatefulMobileNet Phase 0 — MobileNetV2 + EMA state (CoreML 9.0)"
+        input_desc = f"RGB image (1, 3, {args.input_size}, {args.input_size}), float32"
+    
     mlmodel.author = "Dorian — test CoreML stateful API"
     mlmodel.version = "1.0"
-    mlmodel.input_description["x"] = "RGB image (1, 3, H, W), float32"
+    mlmodel.input_description[input_name] = input_desc
     mlmodel.output_description["logits"] = f"Class logits ({args.classes} classes)"
 
     # 5. Sauvegarde
-    model_name = (
-        f"StatefulMobileNet_w{args.width}_c{args.classes}"
-        f"_{H}x{W}_alpha{args.ema_alpha}"
-    )
+    if args.backbone == "mlp":
+        model_name = (
+            f"StatefulMobileNet_Phase1_MLP_d{args.input_dim}_c{args.classes}_alpha{args.ema_alpha}"
+        )
+    elif args.backbone == "hybrid":
+        model_name = (
+            f"StatefulMobileNet_Phase15_Hybrid_{args.input_size}x{args.input_size}_c{args.classes}_alpha{args.ema_alpha}"
+        )
+    else:
+        model_name = (
+            f"StatefulMobileNet_Phase0_w{args.width}_c{args.classes}"
+            f"_{args.input_size}x{args.input_size}_alpha{args.ema_alpha}"
+        )
     out_path = os.path.join(args.out_dir, f"{model_name}.mlpackage")
     mlmodel.save(out_path)
     print(f"\n[5/5] Sauvegardé → {out_path}")
@@ -159,7 +205,12 @@ def export(args):
         max_diffs = []
 
         for i in range(n_frames):
-            x_np = np.random.rand(1, 3, H, W).astype(np.float32)
+            if args.backbone == "mlp":
+                x_np = np.random.rand(1, args.input_dim).astype(np.float32)
+            else:  # cnn or hybrid
+                H = W = args.input_size
+                x_np = np.random.rand(1, 3, H, W).astype(np.float32)
+            
             x_pt = torch.from_numpy(x_np)
 
             # PyTorch forward
@@ -167,7 +218,7 @@ def export(args):
                 pt_out = model(x_pt).numpy()
 
             # CoreML forward (avec state persistant)
-            ct_out = mlmodel.predict({"x": x_np}, state=coreml_state)
+            ct_out = mlmodel.predict({input_name: x_np}, state=coreml_state)
             ct_logits = ct_out["logits"]
 
             max_diff = np.abs(pt_out - ct_logits).max()
