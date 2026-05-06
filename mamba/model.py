@@ -84,6 +84,25 @@ class Hybrid1DBackbone(nn.Module):
         
         return x
 
+# ---------------------------------------------------------------------------
+# RMSNorm (ANE-friendly)
+# ---------------------------------------------------------------------------
+
+class RMSNormANE(nn.Module):
+    """
+    ANE-friendly RMSNorm. 
+    AUCUN cast .float(), et on remplace pow(2) par x * x pour éviter ReduceL2Norm.
+    """
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        variance = (x * x).mean(-1, keepdim=True)
+        rms_inv = torch.rsqrt(variance + self.eps)
+        return x * rms_inv * self.weight
+
 
 # ---------------------------------------------------------------------------
 # Mamba Block (iteratively developed)
@@ -107,6 +126,8 @@ class MambaBlock(nn.Module):
 
     Phase 3: Le Boss de Fin (Trigonométrie & RoPE).
     Intégration du Rotary Position Embedding complet de Mamba3.
+
+    Phase Finale: Mamba3 Complet (RMSNorm + Biais + RoPE + Outer Products).
 
     Args:
         d_model: input/output dimension
@@ -147,6 +168,13 @@ class MambaBlock(nn.Module):
 
         self.in_proj = nn.Linear(d_model, d_in_proj, bias=False)
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+        
+        # ── NOUVEAU : RMSNorm et Biais ──
+        self.B_norm = RMSNormANE(d_state)
+        self.C_norm = RMSNormANE(d_state)
+        # Biais réarrangés en (1, H, S) pour coller directement à l'entrée du RoPE
+        self.B_bias = nn.Parameter(torch.zeros(1, num_heads, d_state))
+        self.C_bias = nn.Parameter(torch.zeros(1, num_heads, d_state))
         
         self.register_buffer("angle_state", torch.zeros(1, num_heads, self.num_rope_angles))
         self.register_buffer("ssm_state", torch.zeros(1, num_heads, headdim, d_state))
@@ -193,7 +221,7 @@ class MambaBlock(nn.Module):
         beta  = (1.0 - lam) * DT * alpha
         gamma = lam * DT
 
-        # --- NOUVEAUTÉ : RoPE ---
+        # --- RoPE et Angles ---
         # 1. Calcul et accumulation de l'angle
         angles = angles_raw.view(1, 1, self.num_rope_angles).repeat(1, self.num_heads, 1)
         delta_theta = torch.tanh(angles) * math.pi * DT.unsqueeze(-1)
@@ -202,10 +230,20 @@ class MambaBlock(nn.Module):
         cos_theta = torch.cos(theta)
         sin_theta = torch.sin(theta)
 
-        # 2. Préparation et Rotation de K et Q
-        K_pre = B_raw.view(1, 1, self.d_state).repeat(1, self.num_heads, 1) # (1, 8, 64)
-        Q_pre = C_raw.view(1, 1, self.d_state).repeat(1, self.num_heads, 1) # (1, 8, 64)
+        # --- NOUVEAU : RMSNorm + Expand + Bias ---
+        # 1. On reshape B_raw/C_raw en (B=1, r=1, g=1, s=64) pour la norme
+        K_norm = self.B_norm(B_raw.view(1, 1, 1, self.d_state)) # -> (1, 1, 1, 64)
+        Q_norm = self.C_norm(C_raw.view(1, 1, 1, self.d_state)) # -> (1, 1, 1, 64)
 
+        # 2. Expand sur les têtes et suppression du (r=1) -> (1, 8, 64)
+        K_expanded = K_norm.repeat(1, 1, self.num_heads, 1).squeeze(1)
+        Q_expanded = Q_norm.repeat(1, 1, self.num_heads, 1).squeeze(1)
+
+        # 3. Ajout des Biais avant le RoPE
+        K_pre = K_expanded + self.B_bias
+        Q_pre = Q_expanded + self.C_bias
+
+        # Rotation
         K_rot = self.apply_rope(K_pre, cos_theta, sin_theta)
         Q_rot = self.apply_rope(Q_pre, cos_theta, sin_theta)
 
