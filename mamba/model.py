@@ -110,7 +110,8 @@ class RMSNormANE(nn.Module):
 
 class MambaBlock(nn.Module):
     """
-    Mamba-like SSM block with state buffers.
+    Mamba3 SISO Iso-fonctionnel & ANE-Native.
+    Inclut RoPE, RMSNorm, dt_bias, et la connexion résiduelle D.
     
     Designed to be edited progressively for ANE testing:
     - Projections for Q, K, V
@@ -176,6 +177,12 @@ class MambaBlock(nn.Module):
         self.B_bias = nn.Parameter(torch.zeros(1, num_heads, d_state))
         self.C_bias = nn.Parameter(torch.zeros(1, num_heads, d_state))
         
+        # ── NOUVEAU : dt_bias et D (Skip connection) ──
+        # Initialisés selon les standards Mamba
+        self.dt_bias = nn.Parameter(torch.zeros(num_heads))
+        self.D = nn.Parameter(torch.ones(num_heads))
+        
+        # Buffers d'état (StateType CoreML)
         self.register_buffer("angle_state", torch.zeros(1, num_heads, self.num_rope_angles))
         self.register_buffer("ssm_state", torch.zeros(1, num_heads, headdim, d_state))
         self.register_buffer("k_state", torch.zeros(1, 1, num_heads, d_state))
@@ -199,6 +206,7 @@ class MambaBlock(nn.Module):
         return torch.cat([out_rot, x_pass], dim=-1) # Recolage -> (1, 8, 64)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # --- Stage 1 : inproj & Slicing Explicite ---
         zxBCdt = self.in_proj(x)
         
         z_raw      = zxBCdt[..., :self._s0]
@@ -210,27 +218,13 @@ class MambaBlock(nn.Module):
         trap_raw   = zxBCdt[..., self._s5:self._s6]
         angles_raw = zxBCdt[..., self._s6:self._s7]
 
-        # 3. Activations pures (Sans clamp = zéro constante infinie dans le graphe)
-        A   = -F.softplus(dd_A)
-        DT  = F.softplus(dd_dt)
+        # --- Stage 2 : Activations (Intégration du dt_bias et du hack mathématique ANE-safe pour le clamp) ---
+        A   = -(F.softplus(dd_A) + 1e-4) # Équivalent mathématique du clamp sans crasher CoreML
+        DT  = F.softplus(dd_dt + self.dt_bias) # NOUVEAU : intégration du dt_bias
         lam = torch.sigmoid(trap_raw)
         z   = F.silu(z_raw)
 
-        # Discretisation Coefficients
-        alpha = torch.exp(A * DT)
-        beta  = (1.0 - lam) * DT * alpha
-        gamma = lam * DT
-
-        # --- RoPE et Angles ---
-        # 1. Calcul et accumulation de l'angle
-        angles = angles_raw.view(1, 1, self.num_rope_angles).repeat(1, self.num_heads, 1)
-        delta_theta = torch.tanh(angles) * math.pi * DT.unsqueeze(-1)
-        theta = self.angle_state + delta_theta
-        
-        cos_theta = torch.cos(theta)
-        sin_theta = torch.sin(theta)
-
-        # --- NOUVEAU : RMSNorm + Expand + Bias ---
+        # --- Stage 3 : K, Q Norm : RMSNorm + Expand (Broadcast) + Bias ---
         # 1. On reshape B_raw/C_raw en (B=1, r=1, g=1, s=64) pour la norme
         K_norm = self.B_norm(B_raw.view(1, 1, 1, self.d_state)) # -> (1, 1, 1, 64)
         Q_norm = self.C_norm(C_raw.view(1, 1, 1, self.d_state)) # -> (1, 1, 1, 64)
@@ -243,34 +237,57 @@ class MambaBlock(nn.Module):
         K_pre = K_expanded + self.B_bias
         Q_pre = Q_expanded + self.C_bias
 
-        # Rotation
+        # --- Stage 4 : RoPE et Angles ---
+        # 1. Calcul et accumulation de l'angle
+        angles = angles_raw.view(1, 1, self.num_rope_angles).repeat(1, self.num_heads, 1)
+        delta_theta = torch.tanh(angles) * math.pi * DT.unsqueeze(-1)
+        theta = self.angle_state + delta_theta
+        
+        cos_theta = torch.cos(theta)
+        sin_theta = torch.sin(theta)
+
+        # 2. Rotation
         K_rot = self.apply_rope(K_pre, cos_theta, sin_theta)
         Q_rot = self.apply_rope(Q_pre, cos_theta, sin_theta)
 
-        # 3. Préparation de V
+        # --- Stage 5 : SSM Trapezoid Discretization Coefficients ---
+        alpha = torch.exp(A * DT)           # exponential decay factor
+        beta  = (1.0 - lam) * DT * alpha    # past weighted by trapezoidal rule
+        gamma = lam * DT                    # present weighted by trapezoidal rule
+
+        # Broadcast shapes for state update:
+        g4 = gamma[:, :, None, None]        
+        b4 = beta[:, :, None, None]
+
+        # --- STAGE 6 : SSM RECCURENCE ---
+        # -- Stage 6.1 : SSM Update --
+        # 1. Préparation de V
         V = x_raw.reshape(1, self.num_heads, self.headdim)
 
-        # --- SSM Recurrence ---
+        # 2. Outer products pour la mise à jour de l'état SSM
         v_prev = self.v_state
         k_prev = self.k_state.squeeze(1)
 
         outer_curr = torch.matmul(V.unsqueeze(-1), K_rot.unsqueeze(-2))
         outer_prev = torch.matmul(v_prev.unsqueeze(-1), k_prev.unsqueeze(-2))
 
-        g4 = gamma[:, :, None, None]
-        b4 = beta[:, :, None, None]
+        # 3. Trapezoid state update
         delta_h = b4 * outer_prev + g4 * outer_curr
-
         new_h = alpha[:, :, None, None] * self.ssm_state + delta_h
 
-        # --- State Updates (API StateType) ---
+        # -- Stage 6.2 : State Updates (In-place) --
         self.ssm_state[:] = new_h
         self.k_state[:] = K_rot.unsqueeze(1)
         self.v_state[:] = V
         self.angle_state[:] = theta
 
-        # --- Output y (Produit tensoriel de sortie) ---
+        # --- Stage 7 : Output y (Produit tensoriel de sortie & Intégration de la skip connection D) ---
         y_ssm = torch.matmul(new_h, Q_rot.unsqueeze(-1)).squeeze(-1) # (1, 8, 64)
+        
+        # NOUVEAU : Ajout de la connexion résiduelle D avant le reshape
+        y_ssm = y_ssm + (V * self.D.view(1, -1, 1))
+        
+        # --- Stage 8 : Final projection ---
         y_flat = y_ssm.reshape(1, self.d_inner) # (1, 512)
         
         y = y_flat * z
