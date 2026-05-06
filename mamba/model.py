@@ -96,6 +96,10 @@ class MambaBlock(nn.Module):
     - Projections for Q, K, V
     - State update pattern (initially: slice_assign)
     - Ready to add: RoPE, trig functions, outer products, etc.
+
+    Phase 1: Slicing Explicite & Activations.
+    Test de la tolérance de l'ANE aux non-linéarités (softplus, sigmoid, silu, clamp)
+    et au découpage asymétrique des tenseurs.
     
     Args:
         d_model: input/output dimension
@@ -119,59 +123,62 @@ class MambaBlock(nn.Module):
         self.num_heads = num_heads
         self.ema_alpha = ema_alpha
         
-        self.d_inner = d_model * 2  # Expansion factor
+        self.d_inner = d_model * 2
+        self.num_rope_angles = 16
+
+        self._s0 = self.d_inner
+        self._s1 = self._s0 + self.d_inner
+        self._s2 = self._s1 + self.d_state
+        self._s3 = self._s2 + self.d_state
+        self._s4 = self._s3 + self.num_heads
+        self._s5 = self._s4 + self.num_heads
+        self._s6 = self._s5 + self.num_heads
+        self._s7 = self._s6 + self.num_rope_angles
+
+        d_in_proj = self._s7
+
+        self.in_proj = nn.Linear(d_model, d_in_proj, bias=False)
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
         
-        # Input projection: d_model → 3 * d_inner (Q, K, V)
-        self.in_proj = nn.Linear(d_model, 3 * self.d_inner)
-        
-        # Output projection: d_inner → d_model
-        self.out_proj = nn.Linear(self.d_inner, d_model)
-        
-        # State buffers (registered but not yet used in forward pass)
-        # These are placeholders for progressively adding features
-        self.register_buffer("angle_state", torch.zeros(1, num_heads, 16))
+        self.register_buffer("angle_state", torch.zeros(1, num_heads, self.num_rope_angles))
+        self.register_buffer("ssm_state", torch.zeros(1, num_heads, headdim, d_state))
         self.register_buffer("k_state", torch.zeros(1, 1, num_heads, d_state))
         self.register_buffer("v_state", torch.zeros(1, num_heads, headdim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, d_model)
+        zxBCdt = self.in_proj(x)
         
-        Returns:
-            (B, d_model)
-        """
-        # Project input to Q, K, V
-        # (B, d_model) → (B, 3 * d_inner)
-        qkv = self.in_proj(x)
-        q, k, v = qkv.chunk(3, dim=-1)  # Each: (B, d_inner)
+        z_raw      = zxBCdt[..., :self._s0]
+        x_raw      = zxBCdt[..., self._s0:self._s1]
+        B_raw      = zxBCdt[..., self._s1:self._s2]
+        C_raw      = zxBCdt[..., self._s2:self._s3]
+        dd_dt      = zxBCdt[..., self._s3:self._s4]
+        dd_A       = zxBCdt[..., self._s4:self._s5]
+        trap_raw   = zxBCdt[..., self._s5:self._s6]
+        angles_raw = zxBCdt[..., self._s6:self._s7]
+
+        # 3. Activations pures (Sans clamp = zéro constante infinie dans le graphe)
+        A   = -F.softplus(dd_A)
+        DT  = F.softplus(dd_dt)
+        lam = torch.sigmoid(trap_raw)
+        z   = F.silu(z_raw)
+
+        # 4. Updates via slice_assign (utilisation de .repeat() au lieu de .expand())
+        v_for_state = x_raw[:, :self.num_heads * self.headdim].reshape(1, self.num_heads, self.headdim)
+        k_for_state = B_raw.view(1, 1, 1, self.d_state).repeat(1, 1, self.num_heads, 1)
+        angles_for_state = angles_raw.view(1, 1, self.num_rope_angles).repeat(1, self.num_heads, 1)
         
-        # Read state buffers to ensure they're part of the computation graph
-        # This prevents CoreML from treating them as unused inputs
-        angle_scale = self.angle_state.mean()  # (scalar)
-        k_scale = self.k_state.mean()  # (scalar)
-        v_scale = self.v_state.mean()  # (scalar)
+        self.v_state[:] = v_for_state
+        self.k_state[:] = k_for_state
+        self.angle_state[:] = angles_for_state
         
-        # Apply minimal gating using state information
-        # This makes states active in the forward pass
-        gate_scale = 1.0 + angle_scale * 0.01 + k_scale * 0.01 + v_scale * 0.01
-        v_gated = v * gate_scale
-        
-        # Update state buffers in-place (slice assignment pattern from Phase 4)
-        # Reshape v for state update
-        v_for_state = v_gated[:, :self.num_heads * self.headdim].reshape(1, self.num_heads, self.headdim)
-        self.v_state[:] = self.v_state * (1.0 - self.ema_alpha) + v_for_state * self.ema_alpha
-        
-        # Also update k_state and angle_state with dummy patterns
-        k_for_state = k[:, :self.num_heads * self.d_state].reshape(1, 1, self.num_heads, self.d_state)
-        self.k_state[:] = self.k_state * (1.0 - self.ema_alpha) + k_for_state * self.ema_alpha
-        
-        self.angle_state[:] = self.angle_state * (1.0 - self.ema_alpha) + \
-                              q[:, :self.num_heads * 16].reshape(1, self.num_heads, 16) * self.ema_alpha
-        
-        # Output projection
-        # (B, d_inner) → (B, d_model)
-        out = self.out_proj(v_gated)
+        # Injection des scalaires pour lier les activations au graphe
+        dummy_ssm_update = A.mean() + DT.mean() + lam.mean()
+        self.ssm_state[:] = self.ssm_state * 0.9 + dummy_ssm_update * 0.1
+
+        # 5. Output projection
+        y = x_raw * z
+        out = self.out_proj(y)
         
         return out
 

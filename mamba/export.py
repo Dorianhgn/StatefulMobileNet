@@ -100,7 +100,7 @@ def export(args):
     # [2/5] Check buffers
     print(f"\n[2/5] Verify state buffers (TorchScript)")
     buffers = dict(model.named_buffers())
-    required_buffers = ["mamba.angle_state", "mamba.k_state", "mamba.v_state"]
+    required_buffers = ["mamba.angle_state", "mamba.k_state", "mamba.v_state", "mamba.ssm_state"]
     
     for buf in required_buffers:
         assert buf in buffers, f"ERROR: '{buf}' not in named_buffers()!"
@@ -109,7 +109,7 @@ def export(args):
     print(f"        - mamba.angle_state: {model.mamba.angle_state.shape}")
     print(f"        - mamba.k_state: {model.mamba.k_state.shape}")
     print(f"        - mamba.v_state: {model.mamba.v_state.shape}")
-    
+    print(f"        - mamba.ssm_state: {model.mamba.ssm_state.shape}")
     # [3/5] TorchScript trace
     print(f"\n[3/5] torch.jit.trace")
     shape = (1, 3, args.seq_length)
@@ -138,6 +138,10 @@ def export(args):
         ct.StateType(
             wrapped_type=ct.TensorType(shape=model.mamba.v_state.shape),
             name="mamba.v_state",
+        ),
+        ct.StateType(
+            wrapped_type=ct.TensorType(shape=model.mamba.ssm_state.shape),
+            name="mamba.ssm_state",
         ),
     ]
     
@@ -205,6 +209,7 @@ def export(args):
         model.mamba.angle_state.zero_()
         model.mamba.k_state.zero_()
         model.mamba.v_state.zero_()
+        model.mamba.ssm_state.zero_()
         
         # Create CoreML state
         coreml_state = mlmodel.make_state()
