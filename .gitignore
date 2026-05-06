@@ -226,3 +226,5 @@ exported_model/
 
 docs/
 bisect/
+
+.vscode/
