@@ -45,8 +45,8 @@ def load_config(config_path: str = "phase4_config.yaml") -> dict:
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--backbone", type=str, default="cnn", choices=["cnn", "mlp", "hybrid"],
-                   help="Backbone type: 'cnn' (Phase 0), 'mlp' (Phase 1), 'hybrid' (Phase 1.5)")
+    p.add_argument("--backbone", type=str, default="cnn", choices=["cnn", "mlp", "hybrid", "hybrid1d"],
+                   help="Backbone type: 'cnn' (Phase 0), 'mlp' (Phase 1), 'hybrid' (Phase 1.5), 'hybrid1d' (Conv1D + Linear)")
     p.add_argument("--width", type=float, default=1.0,
                    help="width_mult MobileNetV2 (0.5 / 0.75 / 1.0) — CNN only")
     p.add_argument("--input-dim", type=int, default=256,
@@ -145,6 +145,9 @@ def export(args):
     if args.backbone == "mlp":
         shape = (1, args.input_dim)
         input_name = "x_vec"
+    elif args.backbone == "hybrid1d":
+        shape = (1, 3, args.input_size)  # Conv1D expects (B, C, L)
+        input_name = "x_1d"
     else:  # cnn or hybrid
         H = W = args.input_size
         shape = (1, 3, H, W)
@@ -196,6 +199,24 @@ def export(args):
         model = StatefulMobileNet(
             num_classes=args.classes,
             backbone_type="hybrid",
+            ema_alpha=args.ema_alpha,
+            phase2=args.phase2,
+            phase3=args.phase3,
+            num_states=args.num_states,
+            phase4=args.phase4,
+            phase4_pattern=args.phase4_pattern,
+            phase5=args.phase5,
+            phase5_pattern=args.phase5_pattern,
+            phase6a=args.phase6a,
+            phase6b=args.phase6b,
+            phase6c=args.phase6c,
+        )
+    elif args.backbone == "hybrid1d":
+        phase_label = f"Phase 1.6{phase_suffix}{phase4_suffix}{phase5_suffix}{phase6_suffix}"
+        print(f"\n[1/5] Build StatefulMobileNet {phase_label} (Hybrid 1D Conv1D+Linear, classes={args.classes})")
+        model = StatefulMobileNet(
+            num_classes=args.classes,
+            backbone_type="hybrid1d",
             ema_alpha=args.ema_alpha,
             phase2=args.phase2,
             phase3=args.phase3,
@@ -386,6 +407,9 @@ def export(args):
     if args.backbone == "mlp":
         mlmodel.short_description = f"StatefulMobileNet Phase 1{phase_desc} — MLP + EMA state ({state_desc}) (CoreML 9.0)"
         input_desc = f"Vector input ({args.input_dim}-dim)"
+    elif args.backbone == "hybrid1d":
+        mlmodel.short_description = f"StatefulMobileNet Phase 1.6{phase_desc} — Hybrid 1D Conv1D+Linear + EMA state ({state_desc}) (CoreML 9.0)"
+        input_desc = f"1D sequence (1, 3, {args.input_size}), float32"
     elif args.backbone == "hybrid":
         mlmodel.short_description = f"StatefulMobileNet Phase 1.5{phase_desc} — Hybrid CNN+MLP + EMA state ({state_desc}) (CoreML 9.0)"
         input_desc = f"RGB image (1, 3, {args.input_size}, {args.input_size}), float32"
@@ -413,6 +437,10 @@ def export(args):
     if args.backbone == "mlp":
         model_name = (
             f"StatefulMobileNet_Phase1_MLP_d{args.input_dim}_c{args.classes}_alpha{args.ema_alpha}{phase_suffix}{phase4_suffix}"
+        )
+    elif args.backbone == "hybrid1d":
+        model_name = (
+            f"StatefulMobileNet_Phase16_Hybrid1D_seq{args.input_size}_c{args.classes}_alpha{args.ema_alpha}{phase_suffix}{phase4_suffix}"
         )
     elif args.backbone == "hybrid":
         model_name = (
@@ -462,6 +490,8 @@ def export(args):
         for i in range(n_frames):
             if args.backbone == "mlp":
                 x_np = np.random.rand(1, args.input_dim).astype(np.float32)
+            elif args.backbone == "hybrid1d":
+                x_np = np.random.rand(1, 3, args.input_size).astype(np.float32)
             else:  # cnn or hybrid
                 H = W = args.input_size
                 x_np = np.random.rand(1, 3, H, W).astype(np.float32)

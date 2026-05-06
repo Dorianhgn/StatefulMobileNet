@@ -66,6 +66,73 @@ class HybridBackbone(nn.Module):
         return x
 
 
+class Hybrid1DBackbone(nn.Module):
+    """
+    Hybrid 1D backbone: Conv1D + Linear layers with SiLU only.
+    
+    Designed for 1D sequential input or 2D images flattened to 1D.
+    Uses Conv1D for feature extraction and Linear layers for projection.
+    No BatchNorm or ReLU6 — only SiLU activations as requested.
+    
+    Args:
+        in_channels: number of input channels (default 3 for image-like)
+        hidden_dim: intermediate hidden dimension (default 256)
+        output_dim: output feature dimension (default 512)
+        seq_length: sequence length for Conv1D (default 224, assuming flattened 224×224 image)
+    """
+    def __init__(
+        self,
+        in_channels: int = 3,
+        hidden_dim: int = 256,
+        output_dim: int = 512,
+        seq_length: int = 224,
+    ):
+        super().__init__()
+        self.seq_length = seq_length
+        
+        # Conv1D feature extraction: downsample with stride
+        self.conv1 = nn.Conv1d(
+            in_channels, hidden_dim, kernel_size=5, stride=2, padding=2, bias=True
+        )
+        self.silu1 = nn.SiLU(inplace=True)
+        
+        self.conv2 = nn.Conv1d(
+            hidden_dim, hidden_dim * 2, kernel_size=5, stride=2, padding=2, bias=True
+        )
+        self.silu2 = nn.SiLU(inplace=True)
+        
+        # After 2× stride-2 convolutions: seq_length → seq_length/4
+        conv_out_length = seq_length // 4
+        
+        # Linear layers for final projection
+        self.fc1 = nn.Linear(hidden_dim * 2 * conv_out_length, hidden_dim * 2)
+        self.silu3 = nn.SiLU(inplace=True)
+        
+        self.fc2 = nn.Linear(hidden_dim * 2, output_dim)
+        self.silu4 = nn.SiLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, in_channels, seq_length) or (B, 3, 224) for image input
+        
+        Returns:
+            (B, output_dim)
+        """
+        # Conv1D blocks
+        x = self.silu1(self.conv1(x))           # (B, hidden_dim, seq_length/2)
+        x = self.silu2(self.conv2(x))           # (B, hidden_dim*2, seq_length/4)
+        
+        # Flatten for linear layers
+        x = x.flatten(1)                        # (B, hidden_dim*2 * seq_length/4)
+        
+        # Linear projection
+        x = self.silu3(self.fc1(x))             # (B, hidden_dim*2)
+        x = self.silu4(self.fc2(x))             # (B, output_dim)
+        
+        return x
+
+
 
 # ---------------------------------------------------------------------------
 # Blocs de base MobileNetV2
@@ -163,7 +230,7 @@ class StatefulMobileNet(nn.Module):
         width_mult:  facteur de largeur MobileNetV2 (0.5, 0.75, 1.0...)
         ema_alpha:   coefficient EMA (0 = état figé, 1 = pas de mémoire)
         feature_dim: dimension du vecteur de features global (après GAP)
-        backbone_type: "cnn" (Phase 0), "mlp" (Phase 1), "hybrid" (Phase 1.5)
+        backbone_type: "cnn" (Phase 0), "mlp" (Phase 1), "hybrid" (Phase 1.5), "hybrid1d" (Conv1D + Linear)
         input_dim:   pour MLP, dimension d'entrée vectorielle
         phase2:      si True, reshape feature_state en 4D (1, nheads, headdim, d_state)
     """
@@ -279,6 +346,18 @@ class StatefulMobileNet(nn.Module):
                 in_channels=3,
                 hidden_dim=hidden_dim,
                 output_dim=output_dim,
+            )
+            last_ch = output_dim
+        elif backbone_type == "hybrid1d":
+            # Hybrid 1D: Conv1D + Linear with SiLU only
+            hidden_dim = 256
+            output_dim = 512
+            seq_length = 224  # Default for 224×224 flattened images or 1D sequences
+            self.backbone = Hybrid1DBackbone(
+                in_channels=3,
+                hidden_dim=hidden_dim,
+                output_dim=output_dim,
+                seq_length=seq_length,
             )
             last_ch = output_dim
         else:
@@ -691,7 +770,7 @@ class StatefulMobileNet(nn.Module):
             feats = self.backbone(x)                    # (B, last_ch, h, w)
             feats = F.adaptive_avg_pool2d(feats, 1)     # (B, last_ch, 1, 1)
             feats = feats.flatten(1)                    # (B, last_ch)
-        elif self.backbone_type in ["mlp", "hybrid"]:
+        elif self.backbone_type in ["mlp", "hybrid", "hybrid1d"]:
             feats = self.backbone(x)                    # already (B, hidden_dim)
 
         feats = self.proj(feats)                        # (B, feature_dim)

@@ -376,3 +376,7 @@ Notes:
 Conclusion: Trigonometric functions and RoPE geometry do not break ANE in this codepath. All Phase 6 variants maintain 100% ANE dispatch, identical median latency (0.31 ms) and stable numeric behavior (no NaN/Inf, FP16 tolerances within expected range).
 
 Recommendation: Proceed to Phase 7 (full Mamba composition) using the RoPE-enabled codepath (6c) as the baseline.
+
+## Last minute addition
+
+The `Hybrid1D` (MLP + Conv1D) works aswell with all phases above on the ANE.
