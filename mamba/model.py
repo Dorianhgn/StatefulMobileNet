@@ -100,7 +100,10 @@ class MambaBlock(nn.Module):
     Phase 1: Slicing Explicite & Activations.
     Test de la tolérance de l'ANE aux non-linéarités (softplus, sigmoid, silu, clamp)
     et au découpage asymétrique des tenseurs.
-    
+
+    Phase 2: Discretisation & SSM Recurrence (Outer Products).
+    Test de la fusion d'état via matmul et de l'intégration temporelle.
+
     Args:
         d_model: input/output dimension
         d_state: SSM state dimension (default 64)
@@ -123,7 +126,7 @@ class MambaBlock(nn.Module):
         self.num_heads = num_heads
         self.ema_alpha = ema_alpha
         
-        self.d_inner = d_model * 2
+        self.d_inner = self.num_heads * self.headdim 
         self.num_rope_angles = 16
 
         self._s0 = self.d_inner
@@ -163,21 +166,45 @@ class MambaBlock(nn.Module):
         lam = torch.sigmoid(trap_raw)
         z   = F.silu(z_raw)
 
-        # 4. Updates via slice_assign (utilisation de .repeat() au lieu de .expand())
-        v_for_state = x_raw[:, :self.num_heads * self.headdim].reshape(1, self.num_heads, self.headdim)
-        k_for_state = B_raw.view(1, 1, 1, self.d_state).repeat(1, 1, self.num_heads, 1)
-        angles_for_state = angles_raw.view(1, 1, self.num_rope_angles).repeat(1, self.num_heads, 1)
-        
-        self.v_state[:] = v_for_state
-        self.k_state[:] = k_for_state
-        self.angle_state[:] = angles_for_state
-        
-        # Injection des scalaires pour lier les activations au graphe
-        dummy_ssm_update = A.mean() + DT.mean() + lam.mean()
-        self.ssm_state[:] = self.ssm_state * 0.9 + dummy_ssm_update * 0.1
+        # 3.5 Discretisation Coefficients (Nouvelle mécanique)
+        alpha = torch.exp(A * DT)
+        beta  = (1.0 - lam) * DT * alpha
+        gamma = lam * DT
 
-        # 5. Output projection
-        y = x_raw * z
+        # 4. Préparation de V, K, Q (Sans RoPE pour l'instant)
+        V = x_raw.reshape(1, self.num_heads, self.headdim)
+        # On passe B_raw/C_raw en (1, 8, 64)
+        K = B_raw.view(1, 1, self.d_state).repeat(1, self.num_heads, 1) 
+        Q = C_raw.view(1, 1, self.d_state).repeat(1, self.num_heads, 1)
+
+        # 5. SSM Recurrence (Le test décisif de la Phase 2)
+        v_prev = self.v_state
+        k_prev = self.k_state.squeeze(1) # (1, 8, 64)
+
+        # Outer products
+        outer_curr = torch.matmul(V.unsqueeze(-1), K.unsqueeze(-2))
+        outer_prev = torch.matmul(v_prev.unsqueeze(-1), k_prev.unsqueeze(-2))
+
+        g4 = gamma[:, :, None, None]
+        b4 = beta[:, :, None, None]
+        delta_h = b4 * outer_prev + g4 * outer_curr
+
+        new_h = alpha[:, :, None, None] * self.ssm_state + delta_h
+
+        # 6. State Updates in-place (API StateType)
+        self.ssm_state[:] = new_h
+        self.k_state[:] = K.unsqueeze(1)
+        self.v_state[:] = V
+        
+        # On garde le dummy update pour l'angle, qui sera remplace par le ROPE dans la Phase 3
+        angles_for_state = angles_raw.view(1, 1, self.num_rope_angles).repeat(1, self.num_heads, 1)
+        self.angle_state[:] = angles_for_state
+
+        # 7. Output y (Produit tensoriel de sortie)
+        y_ssm = torch.matmul(new_h, Q.unsqueeze(-1)).squeeze(-1) # (1, 8, 64)
+        y_flat = y_ssm.reshape(1, self.d_inner) # (1, 512)
+        
+        y = y_flat * z
         out = self.out_proj(y)
         
         return out
