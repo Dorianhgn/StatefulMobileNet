@@ -8,6 +8,7 @@ Combines:
 """
 
 import sys
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -104,6 +105,9 @@ class MambaBlock(nn.Module):
     Phase 2: Discretisation & SSM Recurrence (Outer Products).
     Test de la fusion d'état via matmul et de l'intégration temporelle.
 
+    Phase 3: Le Boss de Fin (Trigonométrie & RoPE).
+    Intégration du Rotary Position Embedding complet de Mamba3.
+
     Args:
         d_model: input/output dimension
         d_state: SSM state dimension (default 64)
@@ -128,6 +132,7 @@ class MambaBlock(nn.Module):
         
         self.d_inner = self.num_heads * self.headdim 
         self.num_rope_angles = 16
+        self.rotary_dim = self.num_rope_angles * 2 # 32
 
         self._s0 = self.d_inner
         self._s1 = self._s0 + self.d_inner
@@ -148,6 +153,23 @@ class MambaBlock(nn.Module):
         self.register_buffer("k_state", torch.zeros(1, 1, num_heads, d_state))
         self.register_buffer("v_state", torch.zeros(1, num_heads, headdim))
 
+    def apply_rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """
+        Application statique du RoPE, optimisée pour l'ANE (sans `if` dynamique).
+        x shape: (1, 8, 64) | cos/sin shape: (1, 8, 16)
+        """
+        x_rot = x[..., :self.rotary_dim] # Les 32 premiers éléments
+        x_pass = x[..., self.rotary_dim:] # Les 32 derniers éléments intacts
+        
+        x0 = x_rot[..., 0::2] # Shape: (1, 8, 16)
+        x1 = x_rot[..., 1::2] # Shape: (1, 8, 16)
+        
+        xo0 = x0 * cos - x1 * sin
+        xo1 = x0 * sin + x1 * cos
+        
+        out_rot = torch.stack([xo0, xo1], dim=-1).flatten(-2) # Recombine en (1, 8, 32)
+        return torch.cat([out_rot, x_pass], dim=-1) # Recolage -> (1, 8, 64)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         zxBCdt = self.in_proj(x)
         
@@ -166,23 +188,35 @@ class MambaBlock(nn.Module):
         lam = torch.sigmoid(trap_raw)
         z   = F.silu(z_raw)
 
-        # 3.5 Discretisation Coefficients (Nouvelle mécanique)
+        # Discretisation Coefficients
         alpha = torch.exp(A * DT)
         beta  = (1.0 - lam) * DT * alpha
         gamma = lam * DT
 
-        # 4. Préparation de V, K, Q (Sans RoPE pour l'instant)
+        # --- NOUVEAUTÉ : RoPE ---
+        # 1. Calcul et accumulation de l'angle
+        angles = angles_raw.view(1, 1, self.num_rope_angles).repeat(1, self.num_heads, 1)
+        delta_theta = torch.tanh(angles) * math.pi * DT.unsqueeze(-1)
+        theta = self.angle_state + delta_theta
+        
+        cos_theta = torch.cos(theta)
+        sin_theta = torch.sin(theta)
+
+        # 2. Préparation et Rotation de K et Q
+        K_pre = B_raw.view(1, 1, self.d_state).repeat(1, self.num_heads, 1) # (1, 8, 64)
+        Q_pre = C_raw.view(1, 1, self.d_state).repeat(1, self.num_heads, 1) # (1, 8, 64)
+
+        K_rot = self.apply_rope(K_pre, cos_theta, sin_theta)
+        Q_rot = self.apply_rope(Q_pre, cos_theta, sin_theta)
+
+        # 3. Préparation de V
         V = x_raw.reshape(1, self.num_heads, self.headdim)
-        # On passe B_raw/C_raw en (1, 8, 64)
-        K = B_raw.view(1, 1, self.d_state).repeat(1, self.num_heads, 1) 
-        Q = C_raw.view(1, 1, self.d_state).repeat(1, self.num_heads, 1)
 
-        # 5. SSM Recurrence (Le test décisif de la Phase 2)
+        # --- SSM Recurrence ---
         v_prev = self.v_state
-        k_prev = self.k_state.squeeze(1) # (1, 8, 64)
+        k_prev = self.k_state.squeeze(1)
 
-        # Outer products
-        outer_curr = torch.matmul(V.unsqueeze(-1), K.unsqueeze(-2))
+        outer_curr = torch.matmul(V.unsqueeze(-1), K_rot.unsqueeze(-2))
         outer_prev = torch.matmul(v_prev.unsqueeze(-1), k_prev.unsqueeze(-2))
 
         g4 = gamma[:, :, None, None]
@@ -191,17 +225,14 @@ class MambaBlock(nn.Module):
 
         new_h = alpha[:, :, None, None] * self.ssm_state + delta_h
 
-        # 6. State Updates in-place (API StateType)
+        # --- State Updates (API StateType) ---
         self.ssm_state[:] = new_h
-        self.k_state[:] = K.unsqueeze(1)
+        self.k_state[:] = K_rot.unsqueeze(1)
         self.v_state[:] = V
-        
-        # On garde le dummy update pour l'angle, qui sera remplace par le ROPE dans la Phase 3
-        angles_for_state = angles_raw.view(1, 1, self.num_rope_angles).repeat(1, self.num_heads, 1)
-        self.angle_state[:] = angles_for_state
+        self.angle_state[:] = theta
 
-        # 7. Output y (Produit tensoriel de sortie)
-        y_ssm = torch.matmul(new_h, Q.unsqueeze(-1)).squeeze(-1) # (1, 8, 64)
+        # --- Output y (Produit tensoriel de sortie) ---
+        y_ssm = torch.matmul(new_h, Q_rot.unsqueeze(-1)).squeeze(-1) # (1, 8, 64)
         y_flat = y_ssm.reshape(1, self.d_inner) # (1, 512)
         
         y = y_flat * z
