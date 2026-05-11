@@ -13,6 +13,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from einops import rearrange
+    HAS_EINOPS = True
+except ImportError:
+    HAS_EINOPS = False
+
 
 # ---------------------------------------------------------------------------
 # Hybrid1D Backbone (ported from model.py)
@@ -302,10 +308,14 @@ class MambaBlock(nn.Module):
 
 class StatefulMambaHybrid1D(nn.Module):
     """
-    StatefulMambaHybrid1D: Hybrid1DBackbone → MambaBlock → Classifier
+    StatefulMambaHybrid1D: Hybrid1DBackbone → [Transform] → MambaBlock → Classifier
     
     Combines a 1D feature extractor with a stateful Mamba block for ANE testing.
     State buffers persist across inferences via ct.StateType in CoreML export.
+    
+    Optional transformations between backbone and mamba:
+    - use_rearrange: Use einops.rearrange instead of view() for reshaping
+    - use_flip: Apply torch.flip to reverse a spatial dimension
     
     Args:
         num_classes: number of output classes
@@ -317,6 +327,8 @@ class StatefulMambaHybrid1D(nn.Module):
         mamba_d_state: SSM state dimension (default 64)
         mamba_headdim: head dimension (default 64)
         mamba_num_heads: number of heads (default 8)
+        use_rearrange: If True, use einops.rearrange for transformations (default False)
+        use_flip: If True, apply torch.flip to features (default False)
     """
     def __init__(
         self,
@@ -329,6 +341,8 @@ class StatefulMambaHybrid1D(nn.Module):
         mamba_d_state: int = 64,
         mamba_headdim: int = 64,
         mamba_num_heads: int = 8,
+        use_rearrange: bool = False,
+        use_flip: bool = False,
     ):
         super().__init__()
         
@@ -356,6 +370,12 @@ class StatefulMambaHybrid1D(nn.Module):
         # Store metadata
         self.feature_dim = backbone_output_dim
         self.ema_alpha = ema_alpha
+        self.use_rearrange = use_rearrange
+        self.use_flip = use_flip
+        
+        # Verify einops availability if use_rearrange is enabled
+        if self.use_rearrange and not HAS_EINOPS:
+            raise ImportError("einops is required for use_rearrange=True. Install with: pip install einops")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -367,7 +387,10 @@ class StatefulMambaHybrid1D(nn.Module):
         """
         # Extract features via Hybrid1D backbone
         # (B, 3, 224) → (B, backbone_output_dim)
-        features = self.backbone(x)
+        features = self.backbone(x)  # (1, 512)
+        
+        # Optional transformations for ANE testing
+        features = self._apply_transformations(features)
         
         # Process through Mamba block (with state updates)
         # (B, backbone_output_dim) → (B, backbone_output_dim)
@@ -377,6 +400,44 @@ class StatefulMambaHybrid1D(nn.Module):
         logits = self.classifier(self.dropout(mamba_out))
         
         return logits
+    
+    def _apply_transformations(self, features: torch.Tensor) -> torch.Tensor:
+        """
+        Apply optional transformations (rearrange, flip) for ANE testing.
+        Input: (1, 512)
+        Output: (1, 512) after optional rearrange/flip
+        """
+        # Reshape to spatial-like: (1, 512) → (1, 512, 1, 1)
+        # This allows us to test rearrange and flip operations
+        b, d = features.shape
+        
+        if self.use_rearrange:
+            # Reshape to 4D spatial: (1, 512, 1, 1)
+            features_4d = rearrange(features, 'b d -> b d 1 1')
+            
+            # Apply optional flip on spatial dimension (dim=3 is the W dimension)
+            if self.use_flip:
+                features_4d = torch.flip(features_4d, dims=[3])
+            
+            # Rearrange back to (1, 512)
+            features = rearrange(features_4d, 'b d h w -> b (d h w)')
+            
+            # Ensure output shape is preserved
+            features = features[:, :d]
+        
+        else:
+            # Base: use view/unsqueeze without einops
+            if self.use_flip:
+                # Reshape to 4D: (1, 512, 1, 1)
+                features_4d = features.view(b, d, 1, 1)
+                
+                # Flip on spatial dimension (dim=3)
+                features_4d = torch.flip(features_4d, dims=[3])
+                
+                # Reshape back to (1, 512)
+                features = features_4d.view(b, d)
+        
+        return features
 
 
 # ---------------------------------------------------------------------------

@@ -51,6 +51,12 @@ def parse_args():
     p.add_argument("--mamba-num-heads", type=int, default=8,
                    help="Number of heads")
     
+    # ANE testing options
+    p.add_argument("--use-rearrange", action="store_true",
+                   help="Use einops.rearrange for feature transformations (ANE testing)")
+    p.add_argument("--use-flip", action="store_true",
+                   help="Use torch.flip on features (ANE testing)")
+    
     # Training/export
     p.add_argument("--ema-alpha", type=float, default=0.1,
                    help="EMA alpha coefficient")
@@ -79,6 +85,17 @@ def export(args):
     print(f"      Mamba block: {args.mamba_num_heads} heads, d_state={args.mamba_d_state}")
     print(f"      Classes: {args.num_classes}, Seq length: {args.seq_length}")
     
+    # Display ANE testing options
+    options_str = []
+    if args.use_rearrange:
+        options_str.append("rearrange (einops)")
+    if args.use_flip:
+        options_str.append("flip (torch)")
+    if options_str:
+        print(f"      ANE testing options: {', '.join(options_str)}")
+    else:
+        print(f"      ANE testing options: None (base mode)")
+    
     model = StatefulMambaHybrid1D(
         num_classes=args.num_classes,
         backbone_in_channels=3,
@@ -89,6 +106,8 @@ def export(args):
         mamba_d_state=args.mamba_d_state,
         mamba_headdim=args.mamba_headdim,
         mamba_num_heads=args.mamba_num_heads,
+        use_rearrange=args.use_rearrange,
+        use_flip=args.use_flip,
     )
     model.eval()
     
@@ -180,9 +199,19 @@ def export(args):
     mlmodel.input_description["x"] = f"1D sequence (1, 3, {args.seq_length}), float32"
     mlmodel.output_description["logits"] = f"Class logits ({args.num_classes} classes)"
     
+    # Build model name with options
+    options_suffix = ""
+    if args.use_rearrange or args.use_flip:
+        opts = []
+        if args.use_rearrange:
+            opts.append("rearrange")
+        if args.use_flip:
+            opts.append("flip")
+        options_suffix = "_" + "_".join(opts)
+    
     model_name = (
         f"StatefulMambaHybrid1D_seq{args.seq_length}_c{args.num_classes}"
-        f"_alpha{args.ema_alpha}"
+        f"_alpha{args.ema_alpha}{options_suffix}"
     )
     out_path = os.path.join(args.out_dir, f"{model_name}.mlpackage")
     mlmodel.save(out_path)

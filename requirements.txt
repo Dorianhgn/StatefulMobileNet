@@ -4,3 +4,4 @@ torchvision==0.20.1
 timm>=1.0.0
 coremltools==9.0   # ou 9.0 si tu veux les dernières features
 numpy>=1.26,<2.0
+einops>=0.3.0,<0.4.0
